@@ -1,0 +1,15 @@
+C:\Users\shang\OneDrive\Desktop\boring rotmg 3\betterSkillys-main\ConsoleApp1\ConsoleApp1\bin\Release\net8.0\win-x64\publish\ConsoleApp1.exe
+C:\Users\shang\OneDrive\Desktop\boring rotmg 3\betterSkillys-main\ConsoleApp1\ConsoleApp1\bin\Release\net8.0\win-x64\publish\libmp3lame.32.dll
+C:\Users\shang\OneDrive\Desktop\boring rotmg 3\betterSkillys-main\ConsoleApp1\ConsoleApp1\bin\Release\net8.0\win-x64\publish\libmp3lame.64.dll
+C:\Users\shang\OneDrive\Desktop\boring rotmg 3\betterSkillys-main\ConsoleApp1\ConsoleApp1\bin\Release\net8.0\win-x64\publish\ConsoleApp1.dll
+C:\Users\shang\OneDrive\Desktop\boring rotmg 3\betterSkillys-main\ConsoleApp1\ConsoleApp1\bin\Release\net8.0\win-x64\publish\ConsoleApp1.deps.json
+C:\Users\shang\OneDrive\Desktop\boring rotmg 3\betterSkillys-main\ConsoleApp1\ConsoleApp1\bin\Release\net8.0\win-x64\publish\ConsoleApp1.runtimeconfig.json
+C:\Users\shang\OneDrive\Desktop\boring rotmg 3\betterSkillys-main\ConsoleApp1\ConsoleApp1\bin\Release\net8.0\win-x64\publish\ConsoleApp1.pdb
+C:\Users\shang\OneDrive\Desktop\boring rotmg 3\betterSkillys-main\ConsoleApp1\ConsoleApp1\bin\Release\net8.0\win-x64\publish\Concentus.dll
+C:\Users\shang\OneDrive\Desktop\boring rotmg 3\betterSkillys-main\ConsoleApp1\ConsoleApp1\bin\Release\net8.0\win-x64\publish\NAudio.dll
+C:\Users\shang\OneDrive\Desktop\boring rotmg 3\betterSkillys-main\ConsoleApp1\ConsoleApp1\bin\Release\net8.0\win-x64\publish\NAudio.Asio.dll
+C:\Users\shang\OneDrive\Desktop\boring rotmg 3\betterSkillys-main\ConsoleApp1\ConsoleApp1\bin\Release\net8.0\win-x64\publish\NAudio.Core.dll
+C:\Users\shang\OneDrive\Desktop\boring rotmg 3\betterSkillys-main\ConsoleApp1\ConsoleApp1\bin\Release\net8.0\win-x64\publish\NAudio.Lame.dll
+C:\Users\shang\OneDrive\Desktop\boring rotmg 3\betterSkillys-main\ConsoleApp1\ConsoleApp1\bin\Release\net8.0\win-x64\publish\NAudio.Midi.dll
+C:\Users\shang\OneDrive\Desktop\boring rotmg 3\betterSkillys-main\ConsoleApp1\ConsoleApp1\bin\Release\net8.0\win-x64\publish\NAudio.Wasapi.dll
+C:\Users\shang\OneDrive\Desktop\boring rotmg 3\betterSkillys-main\ConsoleApp1\ConsoleApp1\bin\Release\net8.0\win-x64\publish\NAudio.WinMM.dll
