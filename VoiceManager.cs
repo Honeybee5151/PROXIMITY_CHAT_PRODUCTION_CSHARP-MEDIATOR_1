@@ -10,6 +10,8 @@ using System.IO;
 using System.Text;
 using System.Collections.Concurrent;
 using System.Linq;
+using Concentus.Structs;
+using Concentus.Enums;
 
 namespace ConsoleApp1
 {
@@ -18,20 +20,21 @@ namespace ConsoleApp1
        #region Fields
        private UdpClient udpSendClient;
        private OpusAudioProcessor opusProcessor;
+       private readonly ConcurrentDictionary<string, OpusDecoder> perSpeakerDecoders = new();
        private UdpClient udpReceiveClient;
        private IPEndPoint serverEndpoint;
 
-       // Dynamic Jitter Buffer - Adaptive based on device type
-       private readonly ConcurrentQueue<byte[]> jitterBuffer = new ConcurrentQueue<byte[]>();
-       private readonly ConcurrentQueue<DateTime> packetArrivalTimes = new ConcurrentQueue<DateTime>();
-       private int MIN_JITTER_PACKETS = 2;    // Will adjust for Bluetooth
-       private int MAX_JITTER_PACKETS = 15;   // Will adjust for Bluetooth
-       private int targetJitterPackets = 3;   // Will adjust for Bluetooth
-       private DateTime lastPacketArrival = DateTime.MinValue;
-       private DateTime expectedNextPacket = DateTime.MinValue;
-       private const int PACKET_INTERVAL_MS = 20;
-       private int consecutiveLatePackets = 0;
-       private int consecutiveOnTimePackets = 0;
+        // Dynamic Jitter Buffer - Per-speaker for proper multi-player mixing
+        private readonly ConcurrentDictionary<string, ConcurrentQueue<byte[]>> speakerBuffers = new();
+        private readonly ConcurrentQueue<DateTime> packetArrivalTimes = new ConcurrentQueue<DateTime>();
+        private int MIN_JITTER_PACKETS = 2;    // Will adjust for Bluetooth
+        private int MAX_JITTER_PACKETS = 15;   // Will adjust for Bluetooth
+        private int targetJitterPackets = 3;   // Will adjust for Bluetooth
+        private DateTime lastPacketArrival = DateTime.MinValue;
+        private DateTime expectedNextPacket = DateTime.MinValue;
+        private const int PACKET_INTERVAL_MS = 20;
+        private int consecutiveLatePackets = 0;
+        private int consecutiveOnTimePackets = 0;
 
        private bool isProcessingVoice = false;
        private readonly CancellationTokenSource cancellationTokenSource = new CancellationTokenSource();
@@ -50,8 +53,9 @@ namespace ConsoleApp1
 
        private WaveFormat detectedOutputFormat;
        private string detectedDeviceName;
-       private bool isBluetoothDevice = false;
-       #endregion
+        private bool isBluetoothDevice = false;
+        public float MasterGain { get; set; } = 1.0f;
+        #endregion
 
        #region Constructor
        public VoiceManager(ActionScriptBridge bridge)
@@ -160,9 +164,12 @@ namespace ConsoleApp1
                isProcessingVoice = true;
                IsVoiceReceiverActive = true;
 
-               // Start listener
-               var listenerStarted = new TaskCompletionSource<bool>();
-               _ = Task.Run(async () => await UdpVoiceListener(listenerStarted), cancellationTokenSource.Token);
+                // Start listener
+                var listenerStarted = new TaskCompletionSource<bool>();
+                _ = Task.Run(async () => await UdpVoiceListener(listenerStarted), cancellationTokenSource.Token);
+
+                // Start audio mixing loop (mixes all speaker buffers concurrently)
+                _ = Task.Run(() => AudioMixingLoop(), cancellationTokenSource.Token);
 
                var timeoutTask = Task.Delay(2000);
                if (await Task.WhenAny(listenerStarted.Task, timeoutTask) == listenerStarted.Task)
@@ -285,68 +292,149 @@ namespace ConsoleApp1
            }
        }
 
-       private async Task ProcessIncomingUdpVoice(byte[] opusAudioData, float serverVolume, string speakerId)
-       {
-           try
-           {
-               if (waveOut?.Volume <= 0f || waveProvider == null)
-               {
-                   return;
-               }
+         private async Task ProcessIncomingUdpVoice(byte[] opusAudioData, float serverVolume, string speakerId)
+         {
+             try
+             {
+                 if (waveOut?.Volume <= 0f || waveProvider == null)
+                     return;
 
-               DateTime arrivalTime = DateTime.Now;
+                 DateTime arrivalTime = DateTime.Now;
 
-               // Track packet timing
-               packetArrivalTimes.Enqueue(arrivalTime);
-               while (packetArrivalTimes.Count > 50)
-               {
-                   packetArrivalTimes.TryDequeue(out _);
-               }
+                 // Track packet timing
+                 packetArrivalTimes.Enqueue(arrivalTime);
+                 while (packetArrivalTimes.Count > 50)
+                     packetArrivalTimes.TryDequeue(out _);
 
-               UpdateDynamicJitterBuffer(arrivalTime);
+                 UpdateDynamicJitterBuffer(arrivalTime);
 
-               // Decode Opus → PCM
-               byte[] rawPcmData = DecodeOpusToRawPcm(opusAudioData);
-               if (rawPcmData.Length == 0) return;
+                 // Decode Opus → PCM (per-speaker decoder prevents state corruption)
+                 byte[] rawPcmData = DecodeOpusToRawPcm(opusAudioData, speakerId);
+                 if (rawPcmData.Length == 0) return;
 
-               // Resample to device format
-               byte[] resampledData = ResampleToDeviceFormat(rawPcmData);
+                 // Resample to device format
+                 byte[] resampledData = ResampleToDeviceFormat(rawPcmData);
 
-               // Apply volume
-               byte[] finalAudio = ApplyVolumeToAudio(resampledData, serverVolume);
+                 // Apply server-side proximity/priority volume
+                 byte[] finalAudio = ApplyVolumeToAudio(resampledData, serverVolume);
 
-               // Add to jitter buffer
-               jitterBuffer.Enqueue(finalAudio);
+                 // Add to per-speaker jitter buffer
+                 var speakerQueue = speakerBuffers.GetOrAdd(speakerId, _ => new ConcurrentQueue<byte[]>());
+                 speakerQueue.Enqueue(finalAudio);
 
-               // Drop oldest if buffer too large
-               while (jitterBuffer.Count > MAX_JITTER_PACKETS)
-               {
-                   jitterBuffer.TryDequeue(out _);
-               }
+                 // Drop oldest if speaker buffer too large (prevent memory growth)
+                 while (speakerQueue.Count > MAX_JITTER_PACKETS)
+                     speakerQueue.TryDequeue(out _);
 
-               // Play when buffer reaches target
-               if (jitterBuffer.Count >= targetJitterPackets)
-               {
-                   while (jitterBuffer.TryDequeue(out var audioPacket))
-                   {
-                       int availableSpace = waveProvider.BufferLength - waveProvider.BufferedBytes;
+                 // NOTE: We do NOT drain/play here anymore.
+                 // The AudioMixingLoop handles mixing all speakers concurrently.
 
-                       if (availableSpace < audioPacket.Length)
-                       {
-                           waveProvider.ClearBuffer();
-                       }
+                 lastPacketArrival = arrivalTime;
+             }
+             catch (Exception ex)
+             {
+                 Console.Error.WriteLine($"🔊 ERROR: {ex.Message}");
+             }
+         }
 
-                       waveProvider.AddSamples(audioPacket, 0, audioPacket.Length);
-                   }
-               }
+        /// <summary>
+        /// Runs on a background thread. Every ~15ms, takes ONE packet from each active speaker,
+        /// mixes them together (sum with clipping), applies MasterGain, and pushes to WaveOut.
+        /// This ensures 20ms real-time = 20ms audio regardless of speaker count.
+        /// </summary>
+        private void AudioMixingLoop()
+        {
+            Console.Error.WriteLine("[MIXER] Audio mixing loop started");
+            int packetSize = 0;
 
-               lastPacketArrival = arrivalTime;
-           }
-           catch (Exception ex)
-           {
-               Console.Error.WriteLine($"🔊 ERROR: {ex.Message}");
-           }
-       }
+            // Wait for first packet to learn the PCM packet size
+            while (packetSize == 0 && isProcessingVoice && !cancellationTokenSource.Token.IsCancellationRequested)
+            {
+                foreach (var queue in speakerBuffers.Values)
+                {
+                    if (queue.TryPeek(out var peeked))
+                    {
+                        packetSize = peeked.Length;
+                        break;
+                    }
+                }
+                Thread.Sleep(10);
+            }
+
+            if (packetSize == 0) return;
+            Console.Error.WriteLine($"[MIXER] Detected packet size: {packetSize} bytes ({packetSize / 2} samples)");
+
+            int sampleCount = packetSize / 2; // 16-bit audio
+
+            while (isProcessingVoice && !cancellationTokenSource.Token.IsCancellationRequested)
+            {
+                try
+                {
+                    int[] mixBuffer = new int[sampleCount]; // Use int to avoid overflow during summing
+                    bool hasAudio = false;
+
+                    foreach (var kvp in speakerBuffers)
+                    {
+                        var queue = kvp.Value;
+
+                        // Only dequeue if speaker has met jitter buffer threshold
+                        if (queue.Count < MIN_JITTER_PACKETS)
+                            continue;
+
+                        if (queue.TryDequeue(out byte[] audioPacket))
+                        {
+                            hasAudio = true;
+
+                            // Safety check: packet size mismatch
+                            int samples = Math.Min(sampleCount, audioPacket.Length / 2);
+
+                            for (int i = 0; i < samples; i++)
+                            {
+                                short sample = (short)(audioPacket[i * 2] | (audioPacket[i * 2 + 1] << 8));
+                                mixBuffer[i] += sample;
+                            }
+                        }
+                    }
+
+                    if (hasAudio && waveProvider != null)
+                    {
+                        byte[] finalBytes = new byte[packetSize];
+                        float gain = MasterGain;
+
+                        for (int i = 0; i < sampleCount; i++)
+                        {
+                            // Apply gain
+                            int mixed = (int)(mixBuffer[i] * gain);
+
+                            // Clamp to 16-bit range
+                            if (mixed > 32767) mixed = 32767;
+                            else if (mixed < -32768) mixed = -32768;
+
+                            finalBytes[i * 2] = (byte)(mixed & 0xFF);
+                            finalBytes[i * 2 + 1] = (byte)((mixed >> 8) & 0xFF);
+                        }
+
+                        // Push mixed audio to output
+                        int availableSpace = waveProvider.BufferLength - waveProvider.BufferedBytes;
+                        if (availableSpace < finalBytes.Length)
+                            waveProvider.ClearBuffer();
+
+                        waveProvider.AddSamples(finalBytes, 0, finalBytes.Length);
+                    }
+
+                    // Sleep ~15ms to keep pace with 20ms packets
+                    // (slightly faster to prevent underrun; WaveOut buffer smooths it)
+                    Thread.Sleep(15);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[MIXER] Error: {ex.Message}");
+                    Thread.Sleep(50);
+                }
+            }
+
+            Console.Error.WriteLine("[MIXER] Audio mixing loop stopped");
+        }
 
        private void UpdateDynamicJitterBuffer(DateTime arrivalTime)
        {
@@ -390,16 +478,25 @@ namespace ConsoleApp1
            return udpSendClient;
        }
 
-       private byte[] DecodeOpusToRawPcm(byte[] opusData)
+       private byte[] DecodeOpusToRawPcm(byte[] opusData, string speakerId)
        {
            try
            {
-               if (opusProcessor == null) return new byte[0];
-               return opusProcessor.DecodeFromOpus(opusData);
+               // Each speaker gets their own decoder to prevent state corruption
+               var decoder = perSpeakerDecoders.GetOrAdd(speakerId, _ => new OpusDecoder(48000, 1));
+
+               short[] pcmOutput = new short[960]; // 20ms at 48kHz mono
+               int decodedSamples = decoder.Decode(opusData, 0, opusData.Length, pcmOutput, 0, pcmOutput.Length, false);
+
+               if (decodedSamples <= 0) return new byte[0];
+
+               byte[] result = new byte[decodedSamples * 2];
+               Buffer.BlockCopy(pcmOutput, 0, result, 0, result.Length);
+               return result;
            }
            catch (Exception ex)
            {
-               Console.Error.WriteLine($"🔊 DECODE ERROR: {ex.Message}");
+               Console.Error.WriteLine($"DECODE ERROR [{speakerId}]: {ex.Message}");
                return new byte[0];
            }
        }
@@ -522,39 +619,37 @@ namespace ConsoleApp1
            }
        }
 
-       public async Task SendAuthenticationToServer(string serverIP, int port, string playerId, string voiceId)
-       {
-           try
-           {
-               Console.Error.WriteLine("⚡ SendAuthenticationToServer CALLED");
+        public async Task SendAuthenticationToServer(string serverIP, int port, string playerId, string voiceId)
+        {
+            try
+            {
+                Console.Error.WriteLine("⚡ SendAuthenticationToServer CALLED");
 
-               serverEndpoint = new IPEndPoint(IPAddress.Parse(serverIP), port);
-              
-               udpSendClient.Connect(serverEndpoint);
+                serverEndpoint = new IPEndPoint(IPAddress.Parse(serverIP), port);
 
-               var localEndpoint = (IPEndPoint)udpSendClient.Client.LocalEndPoint;
-               Console.Error.WriteLine($"[UDP_AUTH] Connected to {serverEndpoint}");
-               Console.Error.WriteLine($"[UDP_AUTH] Local port: {localEndpoint.Port}");
+                var localEndpoint = (IPEndPoint)udpSendClient.Client.LocalEndPoint;
+                Console.Error.WriteLine($"[UDP_AUTH] Target server: {serverEndpoint}");
+                Console.Error.WriteLine($"[UDP_AUTH] Local port: {localEndpoint.Port}");
 
-               var authRequest = new ProximityChatManager.UdpAuthRequest
-               {
-                   PlayerId = playerId,
-                   VoiceId = voiceId,
-                   Command = "AUTH"
-               };
+                var authRequest = new ProximityChatManager.UdpAuthRequest
+                {
+                    PlayerId = playerId,
+                    VoiceId = voiceId,
+                    Command = "AUTH"
+                };
 
-               string jsonData = JsonSerializer.Serialize(authRequest);
-               byte[] authPacket = Encoding.UTF8.GetBytes("AUTH" + jsonData);
+                string jsonData = JsonSerializer.Serialize(authRequest);
+                byte[] authPacket = Encoding.UTF8.GetBytes("AUTH" + jsonData);
 
-               await udpSendClient.SendAsync(authPacket, authPacket.Length);
+                await udpSendClient.SendAsync(authPacket, authPacket.Length, serverEndpoint);
 
-               Console.Error.WriteLine($"[UDP_AUTH] ✅ Authentication sent for player {playerId}");
-           }
-           catch (Exception ex)
-           {
-               Console.Error.WriteLine($"❌ [UDP_AUTH] EXCEPTION: {ex.Message}");
-           }
-       }
+                Console.Error.WriteLine($"[UDP_AUTH] ✅ Authentication sent for player {playerId}");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"❌ [UDP_AUTH] EXCEPTION: {ex.Message}");
+            }
+        }
 
        public void StopVoiceReceiver()
        {
@@ -575,6 +670,10 @@ namespace ConsoleApp1
                udpSendClient?.Close();
                udpSendClient?.Dispose();
                udpSendClient = null;
+
+               // Clean up per-speaker decoders
+               perSpeakerDecoders.Clear();
+               speakerBuffers.Clear();
 
                Console.Error.WriteLine("[UDP_VOICE_CLEANUP] Voice receiver stopped");
            }
@@ -616,47 +715,57 @@ namespace ConsoleApp1
            }
        }
 
-       public void SetIncomingVolume(float volume)
-       {
-           try
-           {
-               float clampedVolume = Math.Max(0f, Math.Min(1f, volume));
-               if (waveOut != null)
-               {
-                   waveOut.Volume = clampedVolume;
-               }
-           }
-           catch (Exception ex)
-           {
-               Console.Error.WriteLine($"Error setting incoming volume: {ex.Message}");
-           }
-       }
+        public void SetIncomingVolume(float volume)
+        {
+            try
+            {
+                // Volume > 1.0 uses software gain (MasterGain) for amplification
+                // Volume 0-1.0 uses hardware volume (waveOut.Volume)
+                if (volume > 1.0f)
+                {
+                    MasterGain = volume; // e.g. 1.5 = 150% via DSP
+                    if (waveOut != null) waveOut.Volume = 1.0f;
+                }
+                else
+                {
+                    MasterGain = 1.0f;
+                    float clampedVolume = Math.Max(0f, Math.Min(1f, volume));
+                    if (waveOut != null)
+                    {
+                        waveOut.Volume = clampedVolume;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Error setting incoming volume: {ex.Message}");
+            }
+        }
 
-       public float GetIncomingVolume()
-       {
-           try
-           {
-               return waveOut?.Volume ?? 0f;
-           }
-           catch (Exception ex)
-           {
-               Console.Error.WriteLine($"Error getting incoming volume: {ex.Message}");
-               return 0f;
-           }
-       }
+        public float GetIncomingVolume()
+        {
+            try
+            {
+                if (MasterGain > 1.0f) return MasterGain;
+                return waveOut?.Volume ?? 0f;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Error getting incoming volume: {ex.Message}");
+                return 0f;
+            }
+        }
 
-       public float GetCurrentVolume()
-       {
-           return waveOut?.Volume ?? 0f;
-       }
+        public float GetCurrentVolume()
+        {
+            if (MasterGain > 1.0f) return MasterGain;
+            return waveOut?.Volume ?? 0f;
+        }
 
-       public void SetVolume(float volume)
-       {
-           if (waveOut != null)
-           {
-               waveOut.Volume = Math.Max(0f, Math.Min(1f, volume));
-           }
-       }
+        public void SetVolume(float volume)
+        {
+            SetIncomingVolume(volume); // Unified: uses MasterGain for > 1.0
+        }
 
        public bool IsVoiceSystemReady()
        {

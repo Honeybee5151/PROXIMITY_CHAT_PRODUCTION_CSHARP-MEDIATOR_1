@@ -285,10 +285,9 @@ namespace ConsoleApp1
       
              // Opus audio data
              Array.Copy(opusData, 0, voicePacket, 2, opusData.Length);
-      
-             await udpClient.SendAsync(voicePacket, voicePacket.Length);
-      
-             Console.Error.WriteLine($"[UDP_VOICE] Sent {opusData.Length} Opus bytes (2-byte header)");
+                   await udpClient.SendAsync(voicePacket, voicePacket.Length, serverEndpoint);
+       
+              Console.Error.WriteLine($"[UDP_VOICE] Sent {opusData.Length} Opus bytes (2-byte header)");
          }
          catch (Exception ex)
          {
@@ -1090,7 +1089,7 @@ namespace ConsoleApp1
                             Console.Error.WriteLine("🎮 Available Commands:");
                             Console.Error.WriteLine("  CONNECT_VOICE:IP:playerID:voiceID - Connect to voice server");
                             Console.Error.WriteLine("  START_MIC / STOP_MIC - Control microphone");
-                            Console.Error.WriteLine("  SET_INCOMING_VOLUME:0.5 - Set playback volume (0.0-1.0)");
+                            Console.Error.WriteLine("  SET_INCOMING_VOLUME:0.5 - Set playback volume (0.0-2.0, above 1.0 = software boost)");
                             Console.Error.WriteLine("  SET_MIC_SENSITIVITY:1.0 - Set mic sensitivity");
                             Console.Error.WriteLine("  SET_NOISE_GATE:0.01 - Set noise gate threshold");
                             Console.Error.WriteLine("  PRIORITY_SETTING:type:value - Send priority command");
