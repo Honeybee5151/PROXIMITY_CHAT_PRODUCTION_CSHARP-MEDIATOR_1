@@ -1042,3 +1042,4 @@ C:\Users\shang\Desktop\Production\ConsoleApp1\obj\Debug\net8.0\win-x64\ConsoleAp
 C:\Users\shang\Desktop\Production\ConsoleApp1\obj\Debug\net8.0\win-x64\ConsoleApp1.genruntimeconfig.cache
 C:\Users\shang\Desktop\Production\ConsoleApp1\obj\Debug\net8.0\win-x64\ref\ConsoleApp1.dll
 C:\Users\shang\Desktop\Production\ConsoleApp1\bin\Debug\net8.0\win-x64\mscordaccore_amd64_amd64_8.0.2325.60607.dll
+C:\Users\shang\Desktop\Production\ConsoleApp1\bin\Debug\net8.0\win-x64\WebRtcVadSharp.dll

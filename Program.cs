@@ -16,6 +16,7 @@ using Concentus.Structs;
 using Concentus.Enums;
 using System.Net;
 using System.Collections.Generic;
+using WebRtcVadSharp;
 
 namespace ConsoleApp1
 {
@@ -208,6 +209,12 @@ namespace ConsoleApp1
 
      public bool allowAudioTransmission = true;
 
+    // WebRTC Voice Activity Detection
+    private readonly WebRtcVad voiceActivityDetector;
+    private bool lastVadResult = false;
+    private int silenceFrameCount = 0;
+    private const int SILENCE_FRAMES_BEFORE_MUTE = 15; // ~300ms of silence before cutting off
+
      // Connection management
      public event EventHandler<string> ConnectionStatusChanged;
      private DateTime lastConnectionCheck = DateTime.Now;
@@ -229,6 +236,14 @@ namespace ConsoleApp1
          currentLevel = 0f;
          peakLevel = 0f;
          smoothedLevel = 0f;
+
+         // Initialize WebRTC VAD - 48kHz, 20ms frames
+         voiceActivityDetector = new WebRtcVad()
+         {
+             OperatingMode = OperatingMode.HighQuality,
+             FrameLength = WebRtcVadSharp.FrameLength.Is20ms,
+             SampleRate = WebRtcVadSharp.SampleRate.Is48kHz
+         };
 
          RefreshMicrophones();
      }
@@ -594,11 +609,44 @@ namespace ConsoleApp1
 
             // --- 👆 END OF ADDED VISUALIZER LOGIC 👆 ---
 
-            if (level > NoiseGate && allowAudioTransmission && isConnectedToServer)
+            if (allowAudioTransmission && isConnectedToServer)
             {
-                // Encode to Opus
-                byte[] opusData = opusProcessor.EncodeToOpus(frameBytes);
-                outgoingOpusData.Enqueue(opusData);
+                // WebRTC VAD: detect if this frame contains actual speech
+                bool isSpeech = false;
+                try
+                {
+                    isSpeech = voiceActivityDetector.HasSpeech(frameBytes);
+                }
+                catch
+                {
+                    // Fallback to noise gate if VAD fails
+                    isSpeech = level > NoiseGate;
+                }
+
+                if (isSpeech)
+                {
+                    lastVadResult = true;
+                    silenceFrameCount = 0;
+
+                    // Encode to Opus and send
+                    byte[] opusData = opusProcessor.EncodeToOpus(frameBytes);
+                    outgoingOpusData.Enqueue(opusData);
+                }
+                else
+                {
+                    silenceFrameCount++;
+
+                    // Keep sending for a short tail to avoid cutting off words
+                    if (lastVadResult && silenceFrameCount < SILENCE_FRAMES_BEFORE_MUTE)
+                    {
+                        byte[] opusData = opusProcessor.EncodeToOpus(frameBytes);
+                        outgoingOpusData.Enqueue(opusData);
+                    }
+                    else
+                    {
+                        lastVadResult = false;
+                    }
+                }
             }
         }
     }
@@ -811,6 +859,7 @@ namespace ConsoleApp1
      {
          StopMicrophone();
          DisconnectFromServer();
+         voiceActivityDetector?.Dispose();
 
          udpCancellation.Cancel();
          try

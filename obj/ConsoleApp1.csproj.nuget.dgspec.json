@@ -61,6 +61,10 @@
             "NAudio.Lame": {
               "target": "Package",
               "version": "[2.1.0, )"
+            },
+            "WebRtcVadSharp": {
+              "target": "Package",
+              "version": "[1.3.2, )"
             }
           },
           "imports": [
