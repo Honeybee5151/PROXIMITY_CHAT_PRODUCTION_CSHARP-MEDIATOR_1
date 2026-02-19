@@ -663,13 +663,11 @@ namespace ConsoleApp1
                waveOut = null;
                waveProvider = null;
 
+               // udpSendClient and udpReceiveClient are the same object - only dispose once
+               udpSendClient = null;
                udpReceiveClient?.Close();
                udpReceiveClient?.Dispose();
                udpReceiveClient = null;
-
-               udpSendClient?.Close();
-               udpSendClient?.Dispose();
-               udpSendClient = null;
 
                // Clean up per-speaker decoders
                perSpeakerDecoders.Clear();
@@ -776,9 +774,13 @@ namespace ConsoleApp1
        #region IDisposable
        public void Dispose()
        {
-           StopVoiceReceiver();
+           // Cancel first so background tasks (UDP listener, audio mixer) can exit their loops
            cancellationTokenSource.Cancel();
-           cancellationTokenSource.Dispose();
+
+           // Give background tasks a moment to notice cancellation before we yank resources
+           Thread.Sleep(200);
+
+           StopVoiceReceiver();
 
            try
            {
@@ -791,6 +793,10 @@ namespace ConsoleApp1
            {
                Console.Error.WriteLine($"Error disposing Opus processor: {ex.Message}");
            }
+
+           try { cancellationTokenSource.Dispose(); } catch { }
+
+           Console.Error.WriteLine("[VOICE_MANAGER] Dispose complete");
        }
        #endregion
    }

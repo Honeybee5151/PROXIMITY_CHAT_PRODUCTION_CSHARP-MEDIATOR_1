@@ -981,7 +981,7 @@ namespace ConsoleApp1
          // DON'T start voice receiver here - wait for CONNECT_VOICE command
          // Remove the StartVoiceReceiver call from here
 
-         _ = Task.Run(async () => await ListenForCommands(chatManager, voiceManager, cancellationTokenSource.Token));
+         var commandTask = Task.Run(async () => await ListenForCommands(chatManager, voiceManager, cancellationTokenSource.Token));
 
          Console.Error.WriteLine("🚀🚀🚀 VERSION 14:55 BUILD LOADED 🚀🚀🚀");
          Console.Error.WriteLine("Commands:");
@@ -993,29 +993,44 @@ namespace ConsoleApp1
          {
              e.Cancel = true;
              cancellationTokenSource.Cancel();
-             _ = Task.Run(async () =>
-             {
-                 await Task.Delay(3000);
-                 Environment.Exit(0);
-             });
          };
 
+         // Wait for command listener to exit (EXIT command or stdin closed)
          try
          {
-             while (!cancellationTokenSource.Token.IsCancellationRequested)
-             {
-                 await Task.Delay(1000, cancellationTokenSource.Token);
-             }
+             await commandTask;
          }
-         catch (OperationCanceledException)
+         catch (OperationCanceledException) { }
+         catch (Exception ex)
          {
-             Console.Error.WriteLine("Shutting down...");
+             Console.Error.WriteLine($"[MAIN] Command listener error: {ex.Message}");
          }
-         finally
+
+         Console.Error.WriteLine("[MAIN] Shutting down...");
+
+         // Ensure cancellation is triggered
+         if (!cancellationTokenSource.IsCancellationRequested)
+             cancellationTokenSource.Cancel();
+
+         // Clean up resources
+         try
          {
              chatManager.Dispose();
              voiceManager.Dispose();
          }
+         catch (Exception ex)
+         {
+             Console.Error.WriteLine($"[MAIN] Cleanup error: {ex.Message}");
+         }
+
+         Console.Error.WriteLine("[MAIN] Shutdown complete");
+
+         // Force exit after 2s in case something is still blocking
+         _ = Task.Run(async () =>
+         {
+             await Task.Delay(2000);
+             Environment.Exit(0);
+         });
      }
 
      private static async Task ListenForCommands(ProximityChatManager chatManager, VoiceManager voiceManager,
@@ -1030,10 +1045,18 @@ namespace ConsoleApp1
                 try
                 {
                     string command = Console.ReadLine();
-                    
+
                     // ✅ ADD: Trace raw input immediately
                     Console.Error.WriteLine($"[C# RAW INPUT] Received: '{command}'");
-                    
+
+                    // stdin closed = parent process died or disconnected
+                    if (command == null)
+                    {
+                        Console.Error.WriteLine("[COMMAND_LISTENER] stdin closed (parent process gone) - shutting down");
+                        cancellationTokenSource.Cancel();
+                        return;
+                    }
+
                     if (string.IsNullOrEmpty(command)) continue;
 
                     // ✅ ADD: Trim whitespace to prevent parsing issues
