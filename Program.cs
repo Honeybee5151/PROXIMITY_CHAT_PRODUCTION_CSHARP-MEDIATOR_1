@@ -210,7 +210,8 @@ namespace ConsoleApp1
      public bool allowAudioTransmission = true;
 
     // WebRTC Voice Activity Detection
-    private readonly WebRtcVad voiceActivityDetector;
+    private WebRtcVad voiceActivityDetector;
+    private bool vadAvailable = false;
     private bool lastVadResult = false;
     private int silenceFrameCount = 0;
     private const int SILENCE_FRAMES_BEFORE_MUTE = 15; // ~300ms of silence before cutting off
@@ -238,12 +239,23 @@ namespace ConsoleApp1
          smoothedLevel = 0f;
 
          // Initialize WebRTC VAD - 48kHz, 20ms frames
-         voiceActivityDetector = new WebRtcVad()
+         try
          {
-             OperatingMode = OperatingMode.HighQuality,
-             FrameLength = WebRtcVadSharp.FrameLength.Is20ms,
-             SampleRate = WebRtcVadSharp.SampleRate.Is48kHz
-         };
+             voiceActivityDetector = new WebRtcVad()
+             {
+                 OperatingMode = OperatingMode.HighQuality,
+                 FrameLength = WebRtcVadSharp.FrameLength.Is20ms,
+                 SampleRate = WebRtcVadSharp.SampleRate.Is48kHz
+             };
+             vadAvailable = true;
+             Console.Error.WriteLine("[VAD] WebRTC VAD initialized successfully");
+         }
+         catch (Exception ex)
+         {
+             vadAvailable = false;
+             voiceActivityDetector = null;
+             Console.Error.WriteLine($"[VAD] WebRTC VAD failed to load, using noise gate fallback: {ex.Message}");
+         }
 
          RefreshMicrophones();
      }
@@ -611,15 +623,21 @@ namespace ConsoleApp1
 
             if (allowAudioTransmission && isConnectedToServer)
             {
-                // WebRTC VAD: detect if this frame contains actual speech
+                // Detect speech: use WebRTC VAD if available, otherwise noise gate
                 bool isSpeech = false;
-                try
+                if (vadAvailable && voiceActivityDetector != null)
                 {
-                    isSpeech = voiceActivityDetector.HasSpeech(frameBytes);
+                    try
+                    {
+                        isSpeech = voiceActivityDetector.HasSpeech(frameBytes);
+                    }
+                    catch
+                    {
+                        isSpeech = level > NoiseGate;
+                    }
                 }
-                catch
+                else
                 {
-                    // Fallback to noise gate if VAD fails
                     isSpeech = level > NoiseGate;
                 }
 

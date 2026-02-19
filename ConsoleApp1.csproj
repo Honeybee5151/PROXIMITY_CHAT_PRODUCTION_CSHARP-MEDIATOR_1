@@ -1,14 +1,14 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
         <OutputType>Exe</OutputType>
         <TargetFramework>net8.0</TargetFramework>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
-        <PublishSingleFile>false</PublishSingleFile>  <!-- CHANGE THIS TO FALSE -->
+        <PublishSingleFile>false</PublishSingleFile>
         <SelfContained>true</SelfContained>
         <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-        <PublishTrimmed>false</PublishTrimmed>  <!-- ADD THIS LINE -->
+        <PublishTrimmed>false</PublishTrimmed>
     </PropertyGroup>
 
     <ItemGroup>
@@ -17,5 +17,17 @@
         <PackageReference Include="NAudio.Lame" Version="2.1.0" />
         <PackageReference Include="WebRtcVadSharp" Version="1.3.2" />
     </ItemGroup>
+
+    <!-- Always copy native WebRtcVad.dll next to exe (works regardless of where proximitychat folder is) -->
+    <Target Name="CopyNativeWebRtcVad" AfterTargets="Build;Publish">
+        <Copy SourceFiles="$(OutDir)runtimes\win-x64\native\WebRtcVad.dll"
+              DestinationFolder="$(OutDir)"
+              SkipUnchangedFiles="true"
+              Condition="Exists('$(OutDir)runtimes\win-x64\native\WebRtcVad.dll')" />
+        <Copy SourceFiles="$(PublishDir)runtimes\win-x64\native\WebRtcVad.dll"
+              DestinationFolder="$(PublishDir)"
+              SkipUnchangedFiles="true"
+              Condition="Exists('$(PublishDir)runtimes\win-x64\native\WebRtcVad.dll')" />
+    </Target>
 
 </Project>
