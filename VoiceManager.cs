@@ -64,6 +64,7 @@ namespace ConsoleApp1
        private string detectedDeviceName;
         private bool isBluetoothDevice = false;
         public float MasterGain { get; set; } = 1.0f;
+        private float limiterGain = 1.0f; // Smoothed limiter gain (attack/release)
         #endregion
 
        #region Constructor
@@ -468,10 +469,25 @@ namespace ConsoleApp1
                         audioProducedCount++;
                         byte[] finalBytes = new byte[packetSize];
 
-                        // Auto-gain: scale down when many speakers to prevent clipping
-                        // 1/sqrt(N) keeps perceived loudness natural while avoiding distortion
-                        float mixAttenuation = activeSpeakers > 1 ? 1.0f / (float)Math.Sqrt(activeSpeakers) : 1.0f;
-                        float gain = MasterGain * mixAttenuation;
+                        // Peak limiter (WebRTC-style): only reduce gain when mix actually clips
+                        // Find peak of the raw mix
+                        int framePeakRaw = 0;
+                        for (int i = 0; i < sampleCount; i++)
+                        {
+                            int abs = Math.Abs(mixBuffer[i]);
+                            if (abs > framePeakRaw) framePeakRaw = abs;
+                        }
+
+                        // Calculate needed gain for this frame (1.0 if no clipping)
+                        float neededGain = framePeakRaw > 32767 ? 32767f / framePeakRaw : 1.0f;
+
+                        // Smooth limiter: fast attack (~1 frame), slow release (~50ms = ~2.5 frames)
+                        if (neededGain < limiterGain)
+                            limiterGain = neededGain; // Instant attack — prevent clipping immediately
+                        else
+                            limiterGain = limiterGain + (neededGain - limiterGain) * 0.4f; // ~50ms release
+
+                        float gain = MasterGain * limiterGain;
 
                         for (int i = 0; i < sampleCount; i++)
                         {
@@ -484,16 +500,11 @@ namespace ConsoleApp1
                             finalBytes[i * 2 + 1] = (byte)((mixed >> 8) & 0xFF);
                         }
 
-                        // Track audio levels
-                        int framePeak = 0;
+                        // Track audio levels (reuse framePeakRaw from limiter)
                         for (int i = 0; i < sampleCount; i++)
-                        {
-                            int abs = Math.Abs(mixBuffer[i]);
-                            if (abs > framePeak) framePeak = abs;
                             mixedSampleSum += (long)mixBuffer[i] * mixBuffer[i];
-                        }
-                        if (framePeak > mixedPeakSample) mixedPeakSample = framePeak;
-                        if (framePeak < 100) silentFrameCount++;
+                        if (framePeakRaw > mixedPeakSample) mixedPeakSample = framePeakRaw;
+                        if (framePeakRaw < 100) silentFrameCount++;
 
                         waveProvider.AddSamples(finalBytes, 0, finalBytes.Length);
                     }
