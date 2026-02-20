@@ -17,6 +17,7 @@ using Concentus.Enums;
 using System.Net;
 using System.Collections.Generic;
 using WebRtcVadSharp;
+using RNNoise.NET;
 
 namespace ConsoleApp1
 {
@@ -54,10 +55,13 @@ namespace ConsoleApp1
              encoder = new OpusEncoder(SAMPLE_RATE, CHANNELS, OpusApplication.OPUS_APPLICATION_VOIP);
              decoder = new OpusDecoder(SAMPLE_RATE, CHANNELS);
 
-             // Only set properties that actually exist
-             encoder.Bitrate = 24000;
-             encoder.Complexity = 5;
-      
+             // Match Discord/Mumble quality: 64kbps (Discord default), max complexity
+             encoder.Bitrate = 64000;
+             encoder.Complexity = 10;
+             encoder.UseInbandFEC = true;
+             encoder.PacketLossPercent = 15;
+             encoder.UseDTX = true;
+
              Console.Error.WriteLine("OpusAudioProcessor initialized successfully");
          }
          catch (Exception ex)
@@ -98,7 +102,7 @@ namespace ConsoleApp1
              byte[] result = new byte[encodedBytes];
              Array.Copy(opusOutput, 0, result, 0, encodedBytes);
 
-             Console.Error.WriteLine($"Opus: Encoded {rawPcmData.Length} PCM bytes → {encodedBytes} Opus bytes");
+             // Console.Error.WriteLine($"Opus: Encoded {rawPcmData.Length} PCM bytes → {encodedBytes} Opus bytes");
              return result;
          }
          catch (Exception ex)
@@ -214,7 +218,20 @@ namespace ConsoleApp1
     private bool vadAvailable = false;
     private bool lastVadResult = false;
     private int silenceFrameCount = 0;
-    private const int SILENCE_FRAMES_BEFORE_MUTE = 15; // ~300ms of silence before cutting off
+    private const int SILENCE_FRAMES_BEFORE_MUTE = 8; // ~160ms of silence before cutting off
+    private int vadSpeechFrames = 0;
+    private int vadSilenceFrames = 0;
+    private int vadPacketsSent = 0;
+    private DateTime lastVadDiagTime = DateTime.MinValue;
+
+    // RNNoise ML denoiser
+    private Denoiser rnnDenoiser;
+    private bool rnnDenoiserAvailable = false;
+
+    // Smooth noise gate envelope
+    private float gateEnvelope = 0f;
+    private const float GATE_ATTACK = 0.95f;   // fast open
+    private const float GATE_RELEASE = 0.05f;  // slow close
 
      // Connection management
      public event EventHandler<string> ConnectionStatusChanged;
@@ -243,7 +260,7 @@ namespace ConsoleApp1
          {
              voiceActivityDetector = new WebRtcVad()
              {
-                 OperatingMode = OperatingMode.HighQuality,
+                 OperatingMode = OperatingMode.VeryAggressive,
                  FrameLength = WebRtcVadSharp.FrameLength.Is20ms,
                  SampleRate = WebRtcVadSharp.SampleRate.Is48kHz
              };
@@ -255,6 +272,20 @@ namespace ConsoleApp1
              vadAvailable = false;
              voiceActivityDetector = null;
              Console.Error.WriteLine($"[VAD] WebRTC VAD failed to load, using noise gate fallback: {ex.Message}");
+         }
+
+         // Initialize RNNoise ML denoiser
+         try
+         {
+             rnnDenoiser = new Denoiser();
+             rnnDenoiserAvailable = true;
+             Console.Error.WriteLine("[DENOISE] RNNoise ML denoiser initialized");
+         }
+         catch (Exception ex)
+         {
+             rnnDenoiserAvailable = false;
+             rnnDenoiser = null;
+             Console.Error.WriteLine($"[DENOISE] RNNoise failed to load: {ex.Message}");
          }
 
          RefreshMicrophones();
@@ -314,7 +345,7 @@ namespace ConsoleApp1
              Array.Copy(opusData, 0, voicePacket, 2, opusData.Length);
                    await udpClient.SendAsync(voicePacket, voicePacket.Length, serverEndpoint);
        
-              Console.Error.WriteLine($"[UDP_VOICE] Sent {opusData.Length} Opus bytes (2-byte header)");
+              // Console.Error.WriteLine($"[UDP_VOICE] Sent {opusData.Length} Opus bytes (2-byte header)");
          }
          catch (Exception ex)
          {
@@ -570,7 +601,45 @@ namespace ConsoleApp1
             short[] frame = pcmFrameBuffer.GetRange(0, OPUS_FRAME_SIZE).ToArray();
             pcmFrameBuffer.RemoveRange(0, OPUS_FRAME_SIZE);
 
-            // Calculate audio level for this frame
+            // === AUDIO PROCESSING CHAIN ===
+            // Pipeline: RNNoise first (on natural levels) → then adaptive gain
+            // This matches Discord's approach: denoise clean audio, then boost
+
+            // 1. RNNoise ML denoising on raw mic audio (natural levels)
+            if (rnnDenoiserAvailable && rnnDenoiser != null)
+            {
+                try
+                {
+                    float[] floatBuf = new float[OPUS_FRAME_SIZE];
+                    for (int i = 0; i < OPUS_FRAME_SIZE; i++)
+                        floatBuf[i] = frame[i] / 32768f;
+
+                    rnnDenoiser.Denoise(floatBuf.AsSpan());
+
+                    for (int i = 0; i < OPUS_FRAME_SIZE; i++)
+                        frame[i] = (short)Math.Max(-32767, Math.Min(32767, floatBuf[i] * 32767f));
+                }
+                catch { /* RNNoise failure — use undenoised audio */ }
+            }
+
+            // 2. AGC: boost denoised speech to target volume
+            // WebRTC targets -3 dBFS (~0.71), Mumble targets ~0.92
+            // We use 0.50 RMS which is comfortable and avoids clipping
+            double cleanSumSq = 0;
+            foreach (short s in frame) cleanSumSq += (double)s * s;
+            double cleanRms = Math.Sqrt(cleanSumSq / frame.Length) / 32768.0;
+
+            const float TARGET_RMS = 0.50f;
+            const float MAX_GAIN = 8.0f;
+            float adaptiveGain = cleanRms < 0.002f ? 1.0f
+                : Math.Min((float)(TARGET_RMS / cleanRms), MAX_GAIN);
+            for (int i = 0; i < frame.Length; i++)
+            {
+                float boosted = frame[i] * adaptiveGain;
+                frame[i] = (short)Math.Max(-32767, Math.Min(32767, boosted));
+            }
+
+            // 4. Measure post-processed level for VAD/visualizer
             short maxSample = 0;
             foreach (short sample in frame)
             {
@@ -578,21 +647,11 @@ namespace ConsoleApp1
                 if (abs > maxSample) maxSample = abs;
             }
 
-            // Apply modest boost (NOT 10x!)
-            const float BOOST_GAIN = 3.0f; // Reduced from 10x
-            for (int i = 0; i < frame.Length; i++)
-            {
-                float boosted = frame[i] * BOOST_GAIN;
-                boosted = Math.Max(-32767, Math.Min(32767, boosted));
-                frame[i] = (short)boosted;
-            }
-
-            // Convert back to bytes
+            // Convert to bytes for Opus encoding
             byte[] frameBytes = new byte[OPUS_FRAME_SIZE * 2];
             Buffer.BlockCopy(frame, 0, frameBytes, 0, frameBytes.Length);
 
-            // Check noise gate
-            float level = (maxSample * BOOST_GAIN) / 32768f;
+            float level = maxSample / 32768f;
 
             // --- 👇 ADDED VISUALIZER LOGIC 👇 ---
             
@@ -623,47 +682,77 @@ namespace ConsoleApp1
 
             if (allowAudioTransmission && isConnectedToServer)
             {
-                // Detect speech: use WebRTC VAD if available, otherwise noise gate
+                // Detect speech: level pre-filter + WebRTC VAD
+                // Level pre-filter rejects quiet speaker bleed before VAD even runs
+                const float VAD_MIN_LEVEL = 0.05f; // Below this = definitely not speech (post-denoise level)
                 bool isSpeech = false;
-                if (vadAvailable && voiceActivityDetector != null)
+                if (level >= VAD_MIN_LEVEL)
                 {
-                    try
+                    if (vadAvailable && voiceActivityDetector != null)
                     {
-                        isSpeech = voiceActivityDetector.HasSpeech(frameBytes);
+                        try
+                        {
+                            isSpeech = voiceActivityDetector.HasSpeech(frameBytes);
+                        }
+                        catch
+                        {
+                            isSpeech = level > NoiseGate;
+                        }
                     }
-                    catch
+                    else
                     {
                         isSpeech = level > NoiseGate;
                     }
                 }
-                else
-                {
-                    isSpeech = level > NoiseGate;
-                }
+
+                // Smooth noise gate: soft attack/release prevents chopped words
+                float gateTarget = isSpeech ? 1.0f : 0.0f;
+                float gateCoeff = isSpeech ? GATE_ATTACK : GATE_RELEASE;
+                gateEnvelope = gateEnvelope * gateCoeff + gateTarget * (1f - gateCoeff);
 
                 if (isSpeech)
                 {
+                    vadSpeechFrames++;
                     lastVadResult = true;
                     silenceFrameCount = 0;
 
-                    // Encode to Opus and send
+                    // Apply gate envelope to smooth transitions
+                    if (gateEnvelope < 0.99f)
+                    {
+                        for (int i = 0; i < OPUS_FRAME_SIZE; i++)
+                            frame[i] = (short)(frame[i] * gateEnvelope);
+                        Buffer.BlockCopy(frame, 0, frameBytes, 0, frameBytes.Length);
+                    }
+
                     byte[] opusData = opusProcessor.EncodeToOpus(frameBytes);
                     outgoingOpusData.Enqueue(opusData);
+                    vadPacketsSent++;
                 }
                 else
                 {
+                    vadSilenceFrames++;
                     silenceFrameCount++;
 
-                    // Keep sending for a short tail to avoid cutting off words
                     if (lastVadResult && silenceFrameCount < SILENCE_FRAMES_BEFORE_MUTE)
                     {
                         byte[] opusData = opusProcessor.EncodeToOpus(frameBytes);
                         outgoingOpusData.Enqueue(opusData);
+                        vadPacketsSent++;
                     }
                     else
                     {
                         lastVadResult = false;
                     }
+                }
+
+                // VAD diagnostic every 3 seconds
+                if ((DateTime.Now - lastVadDiagTime).TotalSeconds >= 3)
+                {
+                    Console.Error.WriteLine($"[VAD_DIAG] speech={vadSpeechFrames} silence={vadSilenceFrames} sent={vadPacketsSent} level={level:F3}");
+                    vadSpeechFrames = 0;
+                    vadSilenceFrames = 0;
+                    vadPacketsSent = 0;
+                    lastVadDiagTime = DateTime.Now;
                 }
             }
         }
@@ -878,6 +967,7 @@ namespace ConsoleApp1
          StopMicrophone();
          DisconnectFromServer();
          voiceActivityDetector?.Dispose();
+         rnnDenoiser?.Dispose();
 
          udpCancellation.Cancel();
          try

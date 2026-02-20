@@ -1064,3 +1064,5 @@ C:\Users\shang\Downloads\PROXIMITY_CHAT_PRODUCTION_CLIENT_1-master\PROXIMITY_CHA
 C:\Users\shang\Downloads\PROXIMITY_CHAT_PRODUCTION_CLIENT_1-master\PROXIMITY_CHAT_PRODUCTION_CLIENT_1-master\bin-debug\WebMain\proximitychat\ConsoleApp1.runtimeconfig.json
 C:\Users\shang\Downloads\PROXIMITY_CHAT_PRODUCTION_CLIENT_1-master\PROXIMITY_CHAT_PRODUCTION_CLIENT_1-master\bin-debug\WebMain\proximitychat\ConsoleApp1.dll
 C:\Users\shang\Downloads\PROXIMITY_CHAT_PRODUCTION_CLIENT_1-master\PROXIMITY_CHAT_PRODUCTION_CLIENT_1-master\bin-debug\WebMain\proximitychat\ConsoleApp1.pdb
+C:\Users\shang\Desktop\Production\ConsoleApp1\bin\Debug\net8.0\win-x64\RNNoise.NET.dll
+C:\Users\shang\Desktop\Production\ConsoleApp1\bin\Debug\net8.0\win-x64\rnnoise.dll

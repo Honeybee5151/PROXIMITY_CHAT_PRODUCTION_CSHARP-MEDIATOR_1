@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Threading.Tasks;
 using System.Threading;
+using System.Runtime.InteropServices;
 using NAudio.Wave;
 using System.Text.Json;
 using NAudio.CoreAudioApi;
@@ -17,6 +18,11 @@ namespace ConsoleApp1
 {
    public class VoiceManager : IDisposable
    {
+       [DllImport("winmm.dll")]
+       private static extern int timeBeginPeriod(int uPeriod);
+       [DllImport("winmm.dll")]
+       private static extern int timeEndPeriod(int uPeriod);
+
        #region Fields
        private UdpClient udpSendClient;
        private OpusAudioProcessor opusProcessor;
@@ -27,9 +33,12 @@ namespace ConsoleApp1
         // Dynamic Jitter Buffer - Per-speaker for proper multi-player mixing
         private readonly ConcurrentDictionary<string, ConcurrentQueue<byte[]>> speakerBuffers = new();
         private readonly ConcurrentQueue<DateTime> packetArrivalTimes = new ConcurrentQueue<DateTime>();
-        private int MIN_JITTER_PACKETS = 2;    // Will adjust for Bluetooth
+        private int MIN_JITTER_PACKETS = 1;    // Will adjust for Bluetooth
         private int MAX_JITTER_PACKETS = 15;   // Will adjust for Bluetooth
-        private int targetJitterPackets = 3;   // Will adjust for Bluetooth
+        private int targetJitterPackets = 4;   // Will adjust for Bluetooth
+        private readonly ConcurrentDictionary<string, bool> speakerInitialBufferFilled = new();
+        private readonly ConcurrentDictionary<string, DateTime> speakerLastSeen = new();
+        private DateTime lastSpeakerCleanup = DateTime.Now;
         private DateTime lastPacketArrival = DateTime.MinValue;
         private DateTime expectedNextPacket = DateTime.MinValue;
         private const int PACKET_INTERVAL_MS = 20;
@@ -123,12 +132,13 @@ namespace ConsoleApp1
                }
                else
                {
-                   waveOut.DesiredLatency = 150; // 150ms for wired/USB
+                   waveOut.DesiredLatency = 200; // 200ms for wired/USB
+                   waveOut.NumberOfBuffers = 3;  // 3 buffers for smoother playback
                }
 
-               // Use device's native format
-               detectedOutputFormat = new WaveFormat(detectedSampleRate, detectedBits, detectedChannels);
-               Console.Error.WriteLine($"[UDP_VOICE_INIT] Output Format: {detectedOutputFormat}");
+               // Use Opus native format (48kHz/16-bit/mono) - WaveOut handles device conversion
+               detectedOutputFormat = new WaveFormat(48000, 16, 1);
+               Console.Error.WriteLine($"[UDP_VOICE_INIT] Output Format: {detectedOutputFormat} (device: {detectedSampleRate}Hz/{detectedBits}-bit/{detectedChannels}ch)");
 
                waveProvider = new BufferedWaveProvider(detectedOutputFormat);
 
@@ -266,6 +276,10 @@ namespace ConsoleApp1
                ushort speakerIdShort = BitConverter.ToUInt16(packet, 0);
                string speakerId = speakerIdShort.ToString();
 
+               // Skip own voice — don't play back what we sent
+               if (speakerId == storedPlayerID)
+                   return;
+
                // Parse volume (4 bytes at offset 2)
                float serverVolume = BitConverter.ToSingle(packet, 2);
 
@@ -321,6 +335,7 @@ namespace ConsoleApp1
                  // Add to per-speaker jitter buffer
                  var speakerQueue = speakerBuffers.GetOrAdd(speakerId, _ => new ConcurrentQueue<byte[]>());
                  speakerQueue.Enqueue(finalAudio);
+                 speakerLastSeen[speakerId] = DateTime.Now;
 
                  // Drop oldest if speaker buffer too large (prevent memory growth)
                  while (speakerQueue.Count > MAX_JITTER_PACKETS)
@@ -344,7 +359,10 @@ namespace ConsoleApp1
         /// </summary>
         private void AudioMixingLoop()
         {
-            Console.Error.WriteLine("[MIXER] Audio mixing loop started");
+            // Force 1ms timer resolution for accurate Thread.Sleep
+            timeBeginPeriod(1);
+            Thread.CurrentThread.Priority = ThreadPriority.AboveNormal;
+            Console.Error.WriteLine("[MIXER] Audio mixing loop started (1ms timer, AboveNormal priority)");
             int packetSize = 0;
 
             // Wait for first packet to learn the PCM packet size
@@ -365,27 +383,76 @@ namespace ConsoleApp1
             Console.Error.WriteLine($"[MIXER] Detected packet size: {packetSize} bytes ({packetSize / 2} samples)");
 
             int sampleCount = packetSize / 2; // 16-bit audio
+            int mixCycleCount = 0;
+            int audioProducedCount = 0;
+            int skippedCount = 0;
+            long mixedSampleSum = 0; // For RMS calculation
+            int mixedPeakSample = 0;
+            int silentFrameCount = 0; // frames where peak < 100
+            var diagTimer = System.Diagnostics.Stopwatch.StartNew();
 
             while (isProcessingVoice && !cancellationTokenSource.Token.IsCancellationRequested)
             {
                 try
                 {
-                    int[] mixBuffer = new int[sampleCount]; // Use int to avoid overflow during summing
+                    mixCycleCount++;
+
+                    // Prevent buffer from growing indefinitely: if WaveOut buffer is
+                    // already well-stocked (>400ms), skip this cycle to let it drain.
+                    if (waveProvider != null && waveProvider.BufferedDuration.TotalMilliseconds > 400)
+                    {
+                        Thread.Sleep(18);
+                        continue;
+                    }
+
+                    // Cleanup stale speakers every 10 seconds
+                    if ((DateTime.Now - lastSpeakerCleanup).TotalSeconds >= 10)
+                    {
+                        foreach (var kvp in speakerLastSeen)
+                        {
+                            if ((DateTime.Now - kvp.Value).TotalSeconds > 10)
+                            {
+                                speakerBuffers.TryRemove(kvp.Key, out _);
+                                speakerInitialBufferFilled.TryRemove(kvp.Key, out _);
+                                perSpeakerDecoders.TryRemove(kvp.Key, out _);
+                                speakerLastSeen.TryRemove(kvp.Key, out _);
+                            }
+                        }
+                        lastSpeakerCleanup = DateTime.Now;
+                    }
+
+                    int[] mixBuffer = new int[sampleCount];
                     bool hasAudio = false;
+                    int activeSpeakers = 0;
 
                     foreach (var kvp in speakerBuffers)
                     {
                         var queue = kvp.Value;
+                        string speaker = kvp.Key;
 
-                        // Only dequeue if speaker has met jitter buffer threshold
+                        // Initial buffering: wait for targetJitterPackets before first play
+                        if (!speakerInitialBufferFilled.ContainsKey(speaker))
+                        {
+                            if (queue.Count < targetJitterPackets)
+                            {
+                                skippedCount++;
+                                continue;
+                            }
+                            speakerInitialBufferFilled[speaker] = true;
+                            Console.Error.WriteLine($"[MIXER] Speaker {speaker} initial buffer filled ({queue.Count} packets)");
+                        }
+
                         if (queue.Count < MIN_JITTER_PACKETS)
+                        {
+                            skippedCount++;
                             continue;
+                        }
 
                         if (queue.TryDequeue(out byte[] audioPacket))
                         {
                             hasAudio = true;
+                            activeSpeakers++;
 
-                            // Safety check: packet size mismatch
                             int samples = Math.Min(sampleCount, audioPacket.Length / 2);
 
                             for (int i = 0; i < samples; i++)
@@ -398,15 +465,18 @@ namespace ConsoleApp1
 
                     if (hasAudio && waveProvider != null)
                     {
+                        audioProducedCount++;
                         byte[] finalBytes = new byte[packetSize];
-                        float gain = MasterGain;
+
+                        // Auto-gain: scale down when many speakers to prevent clipping
+                        // 1/sqrt(N) keeps perceived loudness natural while avoiding distortion
+                        float mixAttenuation = activeSpeakers > 1 ? 1.0f / (float)Math.Sqrt(activeSpeakers) : 1.0f;
+                        float gain = MasterGain * mixAttenuation;
 
                         for (int i = 0; i < sampleCount; i++)
                         {
-                            // Apply gain
                             int mixed = (int)(mixBuffer[i] * gain);
 
-                            // Clamp to 16-bit range
                             if (mixed > 32767) mixed = 32767;
                             else if (mixed < -32768) mixed = -32768;
 
@@ -414,17 +484,43 @@ namespace ConsoleApp1
                             finalBytes[i * 2 + 1] = (byte)((mixed >> 8) & 0xFF);
                         }
 
-                        // Push mixed audio to output
-                        int availableSpace = waveProvider.BufferLength - waveProvider.BufferedBytes;
-                        if (availableSpace < finalBytes.Length)
-                            waveProvider.ClearBuffer();
+                        // Track audio levels
+                        int framePeak = 0;
+                        for (int i = 0; i < sampleCount; i++)
+                        {
+                            int abs = Math.Abs(mixBuffer[i]);
+                            if (abs > framePeak) framePeak = abs;
+                            mixedSampleSum += (long)mixBuffer[i] * mixBuffer[i];
+                        }
+                        if (framePeak > mixedPeakSample) mixedPeakSample = framePeak;
+                        if (framePeak < 100) silentFrameCount++;
 
                         waveProvider.AddSamples(finalBytes, 0, finalBytes.Length);
                     }
 
-                    // Sleep ~15ms to keep pace with 20ms packets
-                    // (slightly faster to prevent underrun; WaveOut buffer smooths it)
-                    Thread.Sleep(15);
+                    // Diagnostic log every 2 seconds
+                    if (diagTimer.ElapsedMilliseconds >= 2000)
+                    {
+                        int speakerCount = speakerBuffers.Count;
+                        string bufferInfo = "";
+                        foreach (var kvp in speakerBuffers)
+                            bufferInfo += $" [{kvp.Key}:{kvp.Value.Count}]";
+
+                        int bufferedMs = waveProvider != null ? (int)(waveProvider.BufferedDuration.TotalMilliseconds) : -1;
+                        double rms = audioProducedCount > 0 ? Math.Sqrt(mixedSampleSum / (double)(audioProducedCount * sampleCount)) : 0;
+
+                        Console.Error.WriteLine($"[MIXER_DIAG] cycles={mixCycleCount} produced={audioProducedCount} skipped={skippedCount} silent={silentFrameCount} peak={mixedPeakSample} rms={rms:F0} waveOutBuf={bufferedMs}ms queues:{bufferInfo}");
+
+                        mixCycleCount = 0;
+                        audioProducedCount = 0;
+                        skippedCount = 0;
+                        mixedSampleSum = 0;
+                        mixedPeakSample = 0;
+                        silentFrameCount = 0;
+                        diagTimer.Restart();
+                    }
+
+                    Thread.Sleep(18);
                 }
                 catch (Exception ex)
                 {
@@ -433,6 +529,7 @@ namespace ConsoleApp1
                 }
             }
 
+            timeEndPeriod(1);
             Console.Error.WriteLine("[MIXER] Audio mixing loop stopped");
         }
 

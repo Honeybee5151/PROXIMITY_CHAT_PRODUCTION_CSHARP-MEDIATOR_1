@@ -16,18 +16,17 @@
         <PackageReference Include="NAudio" Version="2.2.1" />
         <PackageReference Include="NAudio.Lame" Version="2.1.0" />
         <PackageReference Include="WebRtcVadSharp" Version="1.3.2" />
+        <PackageReference Include="YellowDogMan.RRNoise.NET" Version="0.1.9" />
     </ItemGroup>
 
-    <!-- Always copy native WebRtcVad.dll next to exe (works regardless of where proximitychat folder is) -->
-    <Target Name="CopyNativeWebRtcVad" AfterTargets="Build;Publish">
-        <Copy SourceFiles="$(OutDir)runtimes\win-x64\native\WebRtcVad.dll"
-              DestinationFolder="$(OutDir)"
-              SkipUnchangedFiles="true"
-              Condition="Exists('$(OutDir)runtimes\win-x64\native\WebRtcVad.dll')" />
-        <Copy SourceFiles="$(PublishDir)runtimes\win-x64\native\WebRtcVad.dll"
-              DestinationFolder="$(PublishDir)"
-              SkipUnchangedFiles="true"
-              Condition="Exists('$(PublishDir)runtimes\win-x64\native\WebRtcVad.dll')" />
+    <!-- Always copy ALL native DLLs from runtimes/win-x64/native/ next to exe -->
+    <Target Name="CopyNativeDlls" AfterTargets="Build;Publish">
+        <ItemGroup>
+            <NativeBuildDlls Include="$(OutDir)runtimes\win-x64\native\*.dll" />
+            <NativePublishDlls Include="$(PublishDir)runtimes\win-x64\native\*.dll" />
+        </ItemGroup>
+        <Copy SourceFiles="@(NativeBuildDlls)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+        <Copy SourceFiles="@(NativePublishDlls)" DestinationFolder="$(PublishDir)" SkipUnchangedFiles="true" Condition="'$(PublishDir)' != ''" />
     </Target>
 
 </Project>

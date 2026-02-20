@@ -252,6 +252,33 @@
         "build": {
           "build/WebRtcVadSharp.targets": {}
         }
+      },
+      "YellowDogMan.RRNoise.NET/0.1.9": {
+        "type": "package",
+        "compile": {
+          "lib/netstandard2.0/RNNoise.NET.dll": {}
+        },
+        "runtime": {
+          "lib/netstandard2.0/RNNoise.NET.dll": {}
+        },
+        "runtimeTargets": {
+          "runtimes/linux-arm64/native/librnnoise.so": {
+            "assetType": "native",
+            "rid": "linux-arm64"
+          },
+          "runtimes/linux-x64/native/librnnoise.so": {
+            "assetType": "native",
+            "rid": "linux-x64"
+          },
+          "runtimes/win-x64/native/rnnoise.dll": {
+            "assetType": "native",
+            "rid": "win-x64"
+          },
+          "runtimes/win-x86/native/rnnoise.dll": {
+            "assetType": "native",
+            "rid": "win-x86"
+          }
+        }
       }
     },
     "net8.0/win-x64": {
@@ -478,6 +505,18 @@
         },
         "build": {
           "build/WebRtcVadSharp.targets": {}
+        }
+      },
+      "YellowDogMan.RRNoise.NET/0.1.9": {
+        "type": "package",
+        "compile": {
+          "lib/netstandard2.0/RNNoise.NET.dll": {}
+        },
+        "runtime": {
+          "lib/netstandard2.0/RNNoise.NET.dll": {}
+        },
+        "native": {
+          "runtimes/win-x64/native/rnnoise.dll": {}
         }
       }
     }
@@ -871,6 +910,22 @@
         "webrtcvadsharp.1.3.2.nupkg.sha512",
         "webrtcvadsharp.nuspec"
       ]
+    },
+    "YellowDogMan.RRNoise.NET/0.1.9": {
+      "sha512": "2lqIr0648oA0qiUlbcTshFe4dm010Lyv+BaP2GGKfN+CI5DOrR7tV3X0kwgYvf/V3DDHllflWiQXhWT7+LTsEg==",
+      "type": "package",
+      "path": "yellowdogman.rrnoise.net/0.1.9",
+      "files": [
+        ".nupkg.metadata",
+        ".signature.p7s",
+        "lib/netstandard2.0/RNNoise.NET.dll",
+        "runtimes/linux-arm64/native/librnnoise.so",
+        "runtimes/linux-x64/native/librnnoise.so",
+        "runtimes/win-x64/native/rnnoise.dll",
+        "runtimes/win-x86/native/rnnoise.dll",
+        "yellowdogman.rrnoise.net.0.1.9.nupkg.sha512",
+        "yellowdogman.rrnoise.net.nuspec"
+      ]
     }
   },
   "projectFileDependencyGroups": {
@@ -878,7 +933,8 @@
       "Concentus >= 2.2.2",
       "NAudio >= 2.2.1",
       "NAudio.Lame >= 2.1.0",
-      "WebRtcVadSharp >= 1.3.2"
+      "WebRtcVadSharp >= 1.3.2",
+      "YellowDogMan.RRNoise.NET >= 0.1.9"
     ]
   },
   "packageFolders": {
@@ -946,6 +1002,10 @@
           "WebRtcVadSharp": {
             "target": "Package",
             "version": "[1.3.2, )"
+          },
+          "YellowDogMan.RRNoise.NET": {
+            "target": "Package",
+            "version": "[0.1.9, )"
           }
         },
         "imports": [
