@@ -48,6 +48,10 @@ namespace ConsoleApp1
        private bool isProcessingVoice = false;
        private readonly CancellationTokenSource cancellationTokenSource = new CancellationTokenSource();
 
+       //777592 - Speaker icon tracking — sends CMD:SPEAKING/CMD:SILENT to Flash
+       private HashSet<string> previousActiveSpeakers = new();
+       private Dictionary<string, int> speakerSilentFrames = new();
+
        private string storedServerIP;
        private string storedPlayerID;
        private string storedVoiceID;
@@ -425,6 +429,7 @@ namespace ConsoleApp1
                     int[] mixBuffer = new int[sampleCount];
                     bool hasAudio = false;
                     int activeSpeakers = 0;
+                    var currentActiveSpeakerIds = new HashSet<string>(); //777592
 
                     foreach (var kvp in speakerBuffers)
                     {
@@ -453,6 +458,7 @@ namespace ConsoleApp1
                         {
                             hasAudio = true;
                             activeSpeakers++;
+                            currentActiveSpeakerIds.Add(speaker); //777592
 
                             int samples = Math.Min(sampleCount, audioPacket.Length / 2);
 
@@ -463,6 +469,35 @@ namespace ConsoleApp1
                             }
                         }
                     }
+
+                    //777592 - Speaker icon events: notify Flash when speakers start/stop
+                    foreach (var id in currentActiveSpeakerIds)
+                    {
+                        speakerSilentFrames.Remove(id);
+                        if (!previousActiveSpeakers.Contains(id))
+                            Console.Error.WriteLine($"CMD:SPEAKING:{id}");
+                    }
+                    foreach (var id in previousActiveSpeakers)
+                    {
+                        if (!currentActiveSpeakerIds.Contains(id))
+                        {
+                            speakerSilentFrames.TryGetValue(id, out int frames);
+                            frames++;
+                            if (frames >= 15) // ~300ms debounce
+                            {
+                                Console.Error.WriteLine($"CMD:SILENT:{id}");
+                                speakerSilentFrames.Remove(id);
+                            }
+                            else
+                            {
+                                speakerSilentFrames[id] = frames;
+                            }
+                        }
+                    }
+                    // Keep speakers with pending silent frames as "previous" so debounce continues
+                    previousActiveSpeakers = new HashSet<string>(currentActiveSpeakerIds);
+                    foreach (var id in speakerSilentFrames.Keys)
+                        previousActiveSpeakers.Add(id);
 
                     if (hasAudio && waveProvider != null)
                     {
