@@ -232,6 +232,11 @@ namespace ConsoleApp1
     private int selfSilentFrames = 0;
     private const int SELF_SILENT_DEBOUNCE = 15; // ~300ms, same as VoiceManager
 
+    // AGC gain smoothing (prevents gain pumping between frames)
+    private float smoothedAgcGain = 1.0f;
+    private const float AGC_ATTACK = 0.3f;   // fast gain reduction (don't clip)
+    private const float AGC_RELEASE = 0.05f;  // slow gain increase (natural sounding)
+
     // RNNoise ML denoiser
     private Denoiser rnnDenoiser;
     private bool rnnDenoiserAvailable = false;
@@ -673,20 +678,30 @@ namespace ConsoleApp1
                 catch { /* RNNoise failure — use undenoised audio */ }
             }
 
-            // 2. AGC: boost denoised speech to target volume
-            // WebRTC targets -3 dBFS (~0.71), Mumble targets ~0.92
-            // We use 0.50 RMS which is comfortable and avoids clipping
+            // 2. VAD-gated AGC: only boost during speech, prevents noise pumping
+            // WebRTC AGC2 uses RNN-VAD to gate gain measurement — we use a simpler
+            // RMS threshold: if frame is quiet (no speech), don't compute new gain,
+            // just let smoothedAgcGain decay toward 1.0
             double cleanSumSq = 0;
             foreach (short s in frame) cleanSumSq += (double)s * s;
             double cleanRms = Math.Sqrt(cleanSumSq / frame.Length) / 32768.0;
 
             const float TARGET_RMS = 0.50f;
             const float MAX_GAIN = 8.0f;
-            float adaptiveGain = cleanRms < 0.002f ? 1.0f
-                : Math.Min((float)(TARGET_RMS / cleanRms), MAX_GAIN);
+            const float AGC_SPEECH_THRESHOLD = 0.01f; // RMS below this = not speech, don't update gain
+
+            if (cleanRms >= AGC_SPEECH_THRESHOLD)
+            {
+                // Speech detected: compute target gain and smooth toward it
+                float targetGain = Math.Min((float)(TARGET_RMS / cleanRms), MAX_GAIN);
+                float coeff = targetGain < smoothedAgcGain ? AGC_ATTACK : AGC_RELEASE;
+                smoothedAgcGain = smoothedAgcGain + (targetGain - smoothedAgcGain) * coeff;
+            }
+            // else: silence — keep current smoothedAgcGain (it will stay stable, no noise pumping)
+
             for (int i = 0; i < frame.Length; i++)
             {
-                float boosted = frame[i] * adaptiveGain;
+                float boosted = frame[i] * smoothedAgcGain;
                 frame[i] = (short)Math.Max(-32767, Math.Min(32767, boosted));
             }
 

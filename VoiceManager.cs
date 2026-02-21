@@ -32,12 +32,17 @@ namespace ConsoleApp1
 
         // Dynamic Jitter Buffer - Per-speaker for proper multi-player mixing
         private readonly ConcurrentDictionary<string, ConcurrentQueue<byte[]>> speakerBuffers = new();
+        // Stores raw Opus packets per speaker for FEC recovery (last packet needed to decode FEC from current)
+        private readonly ConcurrentDictionary<string, byte[]> speakerLastOpusPacket = new();
         private readonly ConcurrentQueue<DateTime> packetArrivalTimes = new ConcurrentQueue<DateTime>();
         private int MIN_JITTER_PACKETS = 1;    // Will adjust for Bluetooth
         private int MAX_JITTER_PACKETS = 15;   // Will adjust for Bluetooth
         private int targetJitterPackets = 4;   // Will adjust for Bluetooth
         private readonly ConcurrentDictionary<string, bool> speakerInitialBufferFilled = new();
         private readonly ConcurrentDictionary<string, DateTime> speakerLastSeen = new();
+        // PLC: track consecutive empty frames per speaker to limit PLC duration
+        private readonly ConcurrentDictionary<string, int> speakerPlcFrames = new();
+        private const int MAX_PLC_FRAMES = 5; // Max 100ms of PLC before giving up
         private DateTime lastSpeakerCleanup = DateTime.Now;
         private DateTime lastPacketArrival = DateTime.MinValue;
         private DateTime expectedNextPacket = DateTime.MinValue;
@@ -137,7 +142,7 @@ namespace ConsoleApp1
                }
                else
                {
-                   waveOut.DesiredLatency = 200; // 200ms for wired/USB
+                   waveOut.DesiredLatency = 100; // 100ms for wired/USB (was 200ms)
                    waveOut.NumberOfBuffers = 3;  // 3 buffers for smoother playback
                }
 
@@ -331,6 +336,10 @@ namespace ConsoleApp1
                  byte[] rawPcmData = DecodeOpusToRawPcm(opusAudioData, speakerId);
                  if (rawPcmData.Length == 0) return;
 
+                 // Store opus packet for FEC recovery and reset PLC counter
+                 speakerLastOpusPacket[speakerId] = opusAudioData;
+                 speakerPlcFrames[speakerId] = 0;
+
                  // Resample to device format
                  byte[] resampledData = ResampleToDeviceFormat(rawPcmData);
 
@@ -394,7 +403,13 @@ namespace ConsoleApp1
             long mixedSampleSum = 0; // For RMS calculation
             int mixedPeakSample = 0;
             int silentFrameCount = 0; // frames where peak < 100
+            int plcGeneratedCount = 0;
             var diagTimer = System.Diagnostics.Stopwatch.StartNew();
+
+            // Precise 20ms timer: Stopwatch-based instead of Thread.Sleep(18)
+            // This eliminates drift between mixer and Opus 20ms frame boundaries
+            var mixTimer = System.Diagnostics.Stopwatch.StartNew();
+            long nextTickMs = 0;
 
             while (isProcessingVoice && !cancellationTokenSource.Token.IsCancellationRequested)
             {
@@ -403,10 +418,10 @@ namespace ConsoleApp1
                     mixCycleCount++;
 
                     // Prevent buffer from growing indefinitely: if WaveOut buffer is
-                    // already well-stocked (>400ms), skip this cycle to let it drain.
-                    if (waveProvider != null && waveProvider.BufferedDuration.TotalMilliseconds > 400)
+                    // already well-stocked (>200ms), skip this cycle to let it drain.
+                    if (waveProvider != null && waveProvider.BufferedDuration.TotalMilliseconds > 200)
                     {
-                        Thread.Sleep(18);
+                        Thread.Sleep(5);
                         continue;
                     }
 
@@ -421,6 +436,8 @@ namespace ConsoleApp1
                                 speakerInitialBufferFilled.TryRemove(kvp.Key, out _);
                                 perSpeakerDecoders.TryRemove(kvp.Key, out _);
                                 speakerLastSeen.TryRemove(kvp.Key, out _);
+                                speakerLastOpusPacket.TryRemove(kvp.Key, out _);
+                                speakerPlcFrames.TryRemove(kvp.Key, out _);
                             }
                         }
                         lastSpeakerCleanup = DateTime.Now;
@@ -448,13 +465,36 @@ namespace ConsoleApp1
                             Console.Error.WriteLine($"[MIXER] Speaker {speaker} initial buffer filled ({queue.Count} packets)");
                         }
 
-                        if (queue.Count < MIN_JITTER_PACKETS)
+                        byte[] audioPacket = null;
+
+                        if (queue.Count >= MIN_JITTER_PACKETS && queue.TryDequeue(out audioPacket))
+                        {
+                            // Normal path: real audio packet
+                            speakerPlcFrames[speaker] = 0;
+                        }
+                        else if (speakerInitialBufferFilled.ContainsKey(speaker))
+                        {
+                            // Buffer underrun — use Opus PLC to fill the gap
+                            speakerPlcFrames.TryGetValue(speaker, out int plcCount);
+                            if (plcCount < MAX_PLC_FRAMES)
+                            {
+                                // Generate PLC audio from the per-speaker decoder
+                                audioPacket = GeneratePlcAudio(speaker);
+                                speakerPlcFrames[speaker] = plcCount + 1;
+                            }
+                            else
+                            {
+                                skippedCount++;
+                                continue;
+                            }
+                        }
+                        else
                         {
                             skippedCount++;
                             continue;
                         }
 
-                        if (queue.TryDequeue(out byte[] audioPacket))
+                        if (audioPacket != null && audioPacket.Length >= 2)
                         {
                             hasAudio = true;
                             activeSpeakers++;
@@ -555,18 +595,22 @@ namespace ConsoleApp1
                         int bufferedMs = waveProvider != null ? (int)(waveProvider.BufferedDuration.TotalMilliseconds) : -1;
                         double rms = audioProducedCount > 0 ? Math.Sqrt(mixedSampleSum / (double)(audioProducedCount * sampleCount)) : 0;
 
-                        Console.Error.WriteLine($"[MIXER_DIAG] cycles={mixCycleCount} produced={audioProducedCount} skipped={skippedCount} silent={silentFrameCount} peak={mixedPeakSample} rms={rms:F0} waveOutBuf={bufferedMs}ms queues:{bufferInfo}");
+                        Console.Error.WriteLine($"[MIXER_DIAG] cycles={mixCycleCount} produced={audioProducedCount} skipped={skippedCount} plc={plcGeneratedCount} silent={silentFrameCount} peak={mixedPeakSample} rms={rms:F0} waveOutBuf={bufferedMs}ms queues:{bufferInfo}");
 
                         mixCycleCount = 0;
                         audioProducedCount = 0;
                         skippedCount = 0;
+                        plcGeneratedCount = 0;
                         mixedSampleSum = 0;
                         mixedPeakSample = 0;
                         silentFrameCount = 0;
                         diagTimer.Restart();
                     }
 
-                    Thread.Sleep(18);
+                    // Precise 20ms timing using Stopwatch instead of Thread.Sleep(18)
+                    nextTickMs += 20;
+                    int sleepMs = (int)(nextTickMs - mixTimer.ElapsedMilliseconds);
+                    if (sleepMs > 0) Thread.Sleep(sleepMs);
                 }
                 catch (Exception ex)
                 {
@@ -641,6 +685,39 @@ namespace ConsoleApp1
            {
                Console.Error.WriteLine($"DECODE ERROR [{speakerId}]: {ex.Message}");
                return new byte[0];
+           }
+       }
+
+       /// <summary>
+       /// Generates PLC (Packet Loss Concealment) audio when a speaker's buffer is empty.
+       /// Opus decoder extrapolates from its internal state to produce smooth filler audio
+       /// instead of silence gaps that cause clicks/pops.
+       /// </summary>
+       private byte[] GeneratePlcAudio(string speakerId)
+       {
+           try
+           {
+               if (!perSpeakerDecoders.TryGetValue(speakerId, out var decoder))
+                   return null;
+
+               short[] pcmOutput = new short[960]; // 20ms at 48kHz mono
+
+               // Call Opus decode with null data — triggers built-in PLC
+               // The decoder uses its internal state to extrapolate missing audio
+               int decodedSamples = decoder.Decode(null, 0, 0, pcmOutput, 0, 960, false);
+
+               if (decodedSamples <= 0) return null;
+
+               // Resample to device format (same as normal path)
+               byte[] rawPcm = new byte[decodedSamples * 2];
+               Buffer.BlockCopy(pcmOutput, 0, rawPcm, 0, rawPcm.Length);
+
+               byte[] resampled = ResampleToDeviceFormat(rawPcm);
+               return resampled;
+           }
+           catch
+           {
+               return null;
            }
        }
 
@@ -821,6 +898,8 @@ namespace ConsoleApp1
                // Clean up per-speaker decoders
                perSpeakerDecoders.Clear();
                speakerBuffers.Clear();
+               speakerLastOpusPacket.Clear();
+               speakerPlcFrames.Clear();
 
                Console.Error.WriteLine("[UDP_VOICE_CLEANUP] Voice receiver stopped");
            }
