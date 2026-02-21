@@ -170,7 +170,10 @@ namespace ConsoleApp1
 
      #region Fields
 
-     private WaveInEvent waveIn;
+     private WasapiCapture wasapiCapture;
+     private WaveFormat targetFormat = new WaveFormat(48000, 16, 1);
+     private MediaFoundationResampler resampler;
+     private IWaveProvider resamplerSource;
      private MMDeviceEnumerator deviceEnumerator;
      private MMDevice selectedDevice;
      private List<MicrophoneInfo> availableMicrophones;
@@ -224,6 +227,11 @@ namespace ConsoleApp1
     private int vadPacketsSent = 0;
     private DateTime lastVadDiagTime = DateTime.MinValue;
 
+    // Self-speaking icon tracking (for testing)
+    private bool selfSpeakingIconShown = false;
+    private int selfSilentFrames = 0;
+    private const int SELF_SILENT_DEBOUNCE = 15; // ~300ms, same as VoiceManager
+
     // RNNoise ML denoiser
     private Denoiser rnnDenoiser;
     private bool rnnDenoiserAvailable = false;
@@ -237,7 +245,6 @@ namespace ConsoleApp1
      public event EventHandler<string> ConnectionStatusChanged;
      private DateTime lastConnectionCheck = DateTime.Now;
      private readonly object reconnectionLock = new object();
-     private bool isReconnecting = false;
      private string storedServerAddress;
      private int storedPort;
 
@@ -436,6 +443,13 @@ namespace ConsoleApp1
      public void SetAudioTransmission(bool enabled)
      {
          allowAudioTransmission = enabled;
+         // Clear self-speaking icon when transmission disabled
+         if (!enabled && selfSpeakingIconShown && serverId != null)
+         {
+             Console.Error.WriteLine($"CMD:SILENT:{serverId}");
+             selfSpeakingIconShown = false;
+             selfSilentFrames = 0;
+         }
          Console.Error.WriteLine($"[AUDIO] Audio transmission {(enabled ? "enabled" : "disabled")}");
      }
 
@@ -531,24 +545,18 @@ namespace ConsoleApp1
 
          try
          {
-             int deviceNumber = GetDeviceNumber(SelectedMicrophoneId);
+             wasapiCapture = new WasapiCapture(selectedDevice, false, 20);
+             Console.Error.WriteLine($"[MIC] WASAPI device format: {wasapiCapture.WaveFormat}");
 
-             waveIn = new WaveInEvent
-             {
-                 DeviceNumber = deviceNumber,
-                 WaveFormat = new WaveFormat(48000, 16, 1), // 48kHz for Opus
-                 BufferMilliseconds = 20 // 20ms chunks for Opus
-             };
-
-             waveIn.DataAvailable += OnAudioDataAvailable;
-             waveIn.RecordingStopped += OnRecordingStopped;
-             waveIn.StartRecording();
+             wasapiCapture.DataAvailable += OnWasapiDataAvailable;
+             wasapiCapture.RecordingStopped += OnRecordingStopped;
+             wasapiCapture.StartRecording();
 
              IsMicrophoneEnabled = true;
              audioUpdateCounter = 0;
 
              actionScriptBridge.SendMicrophoneStatus(true);
-             Console.Error.WriteLine("[MIC] Microphone started successfully");
+             Console.Error.WriteLine("[MIC] Microphone started successfully (WASAPI)");
          }
          catch (Exception ex)
          {
@@ -560,9 +568,17 @@ namespace ConsoleApp1
      {
          try
          {
-             waveIn?.StopRecording();
-             waveIn?.Dispose();
-             waveIn = null;
+             // Clear self-speaking icon immediately
+             if (selfSpeakingIconShown && serverId != null)
+             {
+                 Console.Error.WriteLine($"CMD:SILENT:{serverId}");
+                 selfSpeakingIconShown = false;
+                 selfSilentFrames = 0;
+             }
+
+             wasapiCapture?.StopRecording();
+             wasapiCapture?.Dispose();
+             wasapiCapture = null;
 
              IsMicrophoneEnabled = false;
              currentLevel = 0f;
@@ -582,6 +598,41 @@ namespace ConsoleApp1
          }
      }
  
+    private void OnWasapiDataAvailable(object sender, WaveInEventArgs e)
+    {
+        if (e.BytesRecorded == 0) return;
+
+        var captureFormat = wasapiCapture.WaveFormat;
+
+        // If already 48kHz/16-bit/mono, pass through directly
+        if (captureFormat.SampleRate == 48000 && captureFormat.BitsPerSample == 16 && captureFormat.Channels == 1)
+        {
+            OnAudioDataAvailable(sender, e);
+            return;
+        }
+
+        // Convert from device format to 48kHz/16-bit/mono
+        try
+        {
+            using var inputStream = new RawSourceWaveStream(e.Buffer, 0, e.BytesRecorded, captureFormat);
+            using var resampler = new MediaFoundationResampler(inputStream, targetFormat);
+            resampler.ResamplerQuality = 60;
+
+            byte[] resampledBuffer = new byte[e.BytesRecorded * 4]; // generous buffer
+            int bytesRead = resampler.Read(resampledBuffer, 0, resampledBuffer.Length);
+
+            if (bytesRead > 0)
+            {
+                var convertedArgs = new WaveInEventArgs(resampledBuffer, bytesRead);
+                OnAudioDataAvailable(sender, convertedArgs);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[MIC] Resample error: {ex.Message}");
+        }
+    }
+
     private void OnAudioDataAvailable(object sender, WaveInEventArgs e)
     {
         if (e.BytesRecorded < 2) return;
@@ -754,6 +805,31 @@ namespace ConsoleApp1
                     vadPacketsSent = 0;
                     lastVadDiagTime = DateTime.Now;
                 }
+
+                // Self-speaking icon: show your own icon when transmitting
+                if (serverId != null)
+                {
+                    bool isSending = lastVadResult && allowAudioTransmission;
+                    if (isSending)
+                    {
+                        selfSilentFrames = 0;
+                        if (!selfSpeakingIconShown)
+                        {
+                            Console.Error.WriteLine($"CMD:SPEAKING:{serverId}");
+                            selfSpeakingIconShown = true;
+                        }
+                    }
+                    else if (selfSpeakingIconShown)
+                    {
+                        selfSilentFrames++;
+                        if (selfSilentFrames >= SELF_SILENT_DEBOUNCE)
+                        {
+                            Console.Error.WriteLine($"CMD:SILENT:{serverId}");
+                            selfSpeakingIconShown = false;
+                            selfSilentFrames = 0;
+                        }
+                    }
+                }
             }
         }
     }
@@ -762,14 +838,14 @@ namespace ConsoleApp1
      {
          try
          {
-             if (waveIn != null)
+             if (wasapiCapture != null)
              {
-                 waveIn.DataAvailable -= OnAudioDataAvailable;
-                 waveIn.RecordingStopped -= OnRecordingStopped;
+                 wasapiCapture.DataAvailable -= OnWasapiDataAvailable;
+                 wasapiCapture.RecordingStopped -= OnRecordingStopped;
 
-                 try { waveIn.StopRecording(); } catch { }
-                 try { waveIn.Dispose(); } catch { }
-                 waveIn = null;
+                 try { wasapiCapture.StopRecording(); } catch { }
+                 try { wasapiCapture.Dispose(); } catch { }
+                 wasapiCapture = null;
              }
 
              if (selectedDevice != null)
@@ -794,26 +870,122 @@ namespace ConsoleApp1
          }
      }
 
+     private int micReconnectAttempts = 0;
+     private const int MAX_MIC_RECONNECT_ATTEMPTS = 5;
+     private volatile bool isReconnectingMic = false;
+
      private void OnRecordingStopped(object sender, StoppedEventArgs e)
      {
-         Console.Error.WriteLine("[MIC] Recording stopped");
-     }
-
-     private int GetDeviceNumber(string deviceId)
-     {
-         for (int i = 0; i < WaveInEvent.DeviceCount; i++)
+         if (e.Exception != null)
          {
-             var capabilities = WaveInEvent.GetCapabilities(i);
-
-             if (selectedDevice != null &&
-                 capabilities.ProductName.Contains(selectedDevice.FriendlyName.Split(' ')[0]))
-             {
-                 return i;
-             }
+             Console.Error.WriteLine($"[MIC] Recording stopped with error: {e.Exception.Message}");
+         }
+         else
+         {
+             Console.Error.WriteLine("[MIC] Recording stopped");
          }
 
-         return 0;
+         // Only auto-reconnect if mic was supposed to be active (not a deliberate stop)
+         if (!IsMicrophoneEnabled) return;
+
+         // Device was lost (OBS/IDE grabbed it exclusively, USB unplug, etc.)
+         Console.Error.WriteLine("[MIC] Unexpected recording stop — attempting auto-reconnect...");
+         _ = Task.Run(() => AttemptMicReconnect());
      }
+
+     private async Task AttemptMicReconnect()
+     {
+         if (isReconnectingMic) return;
+         isReconnectingMic = true;
+         micReconnectAttempts = 0;
+
+         try
+         {
+             while (micReconnectAttempts < MAX_MIC_RECONNECT_ATTEMPTS && IsMicrophoneEnabled)
+             {
+                 micReconnectAttempts++;
+                 int delayMs = Math.Min(1000 * micReconnectAttempts, 5000); // 1s, 2s, 3s, 4s, 5s
+                 Console.Error.WriteLine($"[MIC] Reconnect attempt {micReconnectAttempts}/{MAX_MIC_RECONNECT_ATTEMPTS} in {delayMs}ms...");
+                 await Task.Delay(delayMs);
+
+                 if (!IsMicrophoneEnabled) break; // User disabled mic while waiting
+
+                 try
+                 {
+                     // Clean up old capture without clearing IsMicrophoneEnabled
+                     if (wasapiCapture != null)
+                     {
+                         wasapiCapture.DataAvailable -= OnWasapiDataAvailable;
+                         wasapiCapture.RecordingStopped -= OnRecordingStopped;
+                         try { wasapiCapture.Dispose(); } catch { }
+                         wasapiCapture = null;
+                     }
+
+                     // Try the same device first
+                     MMDevice device = null;
+                     if (!string.IsNullOrEmpty(SelectedMicrophoneId))
+                     {
+                         try
+                         {
+                             device = deviceEnumerator.GetDevice(SelectedMicrophoneId);
+                             if (device?.State != DeviceState.Active) device = null;
+                         }
+                         catch { device = null; }
+                     }
+
+                     // Fallback to default device
+                     if (device == null)
+                     {
+                         try
+                         {
+                             device = deviceEnumerator.GetDefaultAudioEndpoint(DataFlow.Capture, Role.Communications);
+                             Console.Error.WriteLine($"[MIC] Original device unavailable, falling back to default: {device?.FriendlyName}");
+                         }
+                         catch { device = null; }
+                     }
+
+                     if (device == null || device.State != DeviceState.Active)
+                     {
+                         Console.Error.WriteLine("[MIC] No active capture device found, will retry...");
+                         continue;
+                     }
+
+                     selectedDevice = device;
+                     wasapiCapture = new WasapiCapture(selectedDevice, false, 20);
+                     wasapiCapture.DataAvailable += OnWasapiDataAvailable;
+                     wasapiCapture.RecordingStopped += OnRecordingStopped;
+                     wasapiCapture.StartRecording();
+
+                     Console.Error.WriteLine($"[MIC] Reconnected successfully to: {device.FriendlyName}");
+                     micReconnectAttempts = 0;
+                     isReconnectingMic = false;
+                     return;
+                 }
+                 catch (Exception ex)
+                 {
+                     Console.Error.WriteLine($"[MIC] Reconnect attempt {micReconnectAttempts} failed: {ex.Message}");
+                 }
+             }
+
+             Console.Error.WriteLine("[MIC] All reconnect attempts exhausted — microphone disabled");
+             IsMicrophoneEnabled = false;
+             actionScriptBridge.SendMicrophoneStatus(false);
+
+             // Clear self-speaking icon
+             if (selfSpeakingIconShown && serverId != null)
+             {
+                 Console.Error.WriteLine($"CMD:SILENT:{serverId}");
+                 selfSpeakingIconShown = false;
+                 selfSilentFrames = 0;
+             }
+         }
+         finally
+         {
+             isReconnectingMic = false;
+         }
+     }
+
+     // GetDeviceNumber removed — WASAPI captures directly from MMDevice, no WaveIn mapping needed
 
      #endregion
 
@@ -875,9 +1047,17 @@ namespace ConsoleApp1
      {
          try
          {
+             // Clear self-speaking icon immediately
+             if (selfSpeakingIconShown && serverId != null)
+             {
+                 Console.Error.WriteLine($"CMD:SILENT:{serverId}");
+                 selfSpeakingIconShown = false;
+                 selfSilentFrames = 0;
+             }
+
              isConnectedToServer = false;
              isAuthenticated = false;
-          
+
              udpClient = null;
 
              ConnectionStatusChanged?.Invoke(this, "Disconnected");

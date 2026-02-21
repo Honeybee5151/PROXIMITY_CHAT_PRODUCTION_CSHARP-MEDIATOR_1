@@ -801,6 +801,12 @@ namespace ConsoleApp1
                isProcessingVoice = false;
                IsVoiceReceiverActive = false;
 
+               // Flush all active speaker icons before cleanup
+               foreach (var id in previousActiveSpeakers)
+                   Console.Error.WriteLine($"CMD:SILENT:{id}");
+               previousActiveSpeakers.Clear();
+               speakerSilentFrames.Clear();
+
                waveOut?.Stop();
                waveOut?.Dispose();
                waveOut = null;
