@@ -21,6 +21,36 @@ using RNNoise.NET;
 
 namespace ConsoleApp1
 {
+ // Simple file logger for diagnosing voice disconnects
+ public static class VoiceLog
+ {
+     private static readonly string LogPath = Path.Combine(
+         AppDomain.CurrentDomain.BaseDirectory, "voice_log.txt");
+     private static readonly object Lock = new object();
+
+     public static void Write(string message)
+     {
+         try
+         {
+             lock (Lock)
+             {
+                 File.AppendAllText(LogPath, $"[{DateTime.Now:HH:mm:ss.fff}] {message}\n");
+             }
+         }
+         catch { } // Never crash the app for logging
+     }
+
+     public static void Init()
+     {
+         try
+         {
+             // Keep log file small — overwrite on each launch
+             File.WriteAllText(LogPath, $"=== Voice Log Started {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===\n");
+         }
+         catch { }
+     }
+ }
+
  // Data structures for communication
  public class MicrophoneInfo
  {
@@ -232,6 +262,9 @@ namespace ConsoleApp1
     private int selfSilentFrames = 0;
     private const int SELF_SILENT_DEBOUNCE = 15; // ~300ms, same as VoiceManager
 
+    // Speaker icon mode: "all" = everyone, "others" = hide self, "off" = no icons
+    private volatile string speakerIconMode = "all";
+
     // AGC gain smoothing (prevents gain pumping between frames)
     private float smoothedAgcGain = 1.0f;
     private const float AGC_ATTACK = 0.3f;   // fast gain reduction (don't clip)
@@ -315,10 +348,21 @@ namespace ConsoleApp1
          {
              try
              {
-                 // Connection health check
+                 // Connection health check — ping every 10s, re-auth if 3 PONGs missed
                  var now = DateTime.Now;
-                 if ((now - lastConnectionCheck).TotalSeconds >= 30)
+                 if ((now - lastConnectionCheck).TotalSeconds >= 10)
                  {
+                     if (voiceManager != null)
+                     {
+                         bool connectionDead = voiceManager.OnPingSent();
+                         if (connectionDead)
+                         {
+                             VoiceLog.Write("HEALTH: 3 PONGs missed — re-authenticating");
+                             Console.Error.WriteLine("[UDP_HEALTH] 3 PONGs missed — re-authenticating...");
+                             voiceManager.ResetPongTracking();
+                             await voiceManager.ReAuthenticate();
+                         }
+                     }
                      await SendPingToServer();
                      lastConnectionCheck = now;
                  }
@@ -456,6 +500,20 @@ namespace ConsoleApp1
              selfSilentFrames = 0;
          }
          Console.Error.WriteLine($"[AUDIO] Audio transmission {(enabled ? "enabled" : "disabled")}");
+     }
+
+     public void SetSpeakerIconMode(string mode)
+     {
+         speakerIconMode = mode;
+         voiceManager?.SetSpeakerIconMode(mode);
+         // Clear self icon if switching away from "all"
+         if (mode != "all" && selfSpeakingIconShown && serverId != null)
+         {
+             Console.Error.WriteLine($"CMD:SILENT:{serverId}");
+             selfSpeakingIconShown = false;
+             selfSilentFrames = 0;
+         }
+         Console.Error.WriteLine($"[AUDIO] Speaker icon mode set to: {mode}");
      }
 
      public void RefreshMicrophones()
@@ -822,9 +880,11 @@ namespace ConsoleApp1
                 }
 
                 // Self-speaking icon: show your own icon when transmitting
-                if (serverId != null)
+                // Require minimum audio level to avoid showing icon for keyboard clicks
+                // that pass VAD but are too quiet for others to hear
+                if (serverId != null && speakerIconMode == "all")
                 {
-                    bool isSending = lastVadResult && allowAudioTransmission;
+                    bool isSending = lastVadResult && allowAudioTransmission && level >= 0.15f;
                     if (isSending)
                     {
                         selfSilentFrames = 0;
@@ -1255,6 +1315,8 @@ namespace ConsoleApp1
 
      static async Task Main(string[] args)
      {
+         VoiceLog.Init();
+         VoiceLog.Write("ConsoleApp1 starting");
          var chatManager = new ProximityChatManager();
          var actionScriptBridge = new ActionScriptBridge();
          var voiceManager = new VoiceManager(actionScriptBridge);
@@ -1291,7 +1353,16 @@ namespace ConsoleApp1
              Console.Error.WriteLine($"[MAIN] Command listener error: {ex.Message}");
          }
 
+         VoiceLog.Write("SHUTDOWN starting");
          Console.Error.WriteLine("[MAIN] Shutting down...");
+
+         // Start force exit FIRST — if Dispose hangs, this guarantees process death
+         _ = Task.Run(async () =>
+         {
+             await Task.Delay(3000);
+             Console.Error.WriteLine("[MAIN] Force exit — Dispose hung");
+             Environment.Exit(0);
+         });
 
          // Ensure cancellation is triggered
          if (!cancellationTokenSource.IsCancellationRequested)
@@ -1309,13 +1380,6 @@ namespace ConsoleApp1
          }
 
          Console.Error.WriteLine("[MAIN] Shutdown complete");
-
-         // Force exit after 2s in case something is still blocking
-         _ = Task.Run(async () =>
-         {
-             await Task.Delay(2000);
-             Environment.Exit(0);
-         });
      }
 
      private static async Task ListenForCommands(ProximityChatManager chatManager, VoiceManager voiceManager,
@@ -1379,6 +1443,7 @@ namespace ConsoleApp1
                                 string playerID = parts[2];
                                 string voiceID = parts[3];
 
+                                VoiceLog.Write($"CONNECT_VOICE server={serverIP} player={playerID}");
                                 Console.Error.WriteLine($"🔌 Connecting UDP voice for player {playerID}...");
 
                                 voiceManager.StoreConnectionDetails(serverIP, playerID, voiceID);
@@ -1387,12 +1452,22 @@ namespace ConsoleApp1
                                 {
                                     Console.Error.WriteLine("🎉 UDP Voice receiver started!");
                                     await voiceManager.SendAuthenticationToServer(serverIP, 2051, playerID, voiceID);
+                                    VoiceLog.Write($"AUTH sent, confirmed={voiceManager.IsAuthConfirmed}");
                                     bool connected = await chatManager.ConnectToServer(serverIP, 2051, playerID, voiceID);
 
                                     if (connected)
                                     {
+                                        VoiceLog.Write("VOICE CONNECTED OK");
                                         Console.Error.WriteLine("✅ UDP voice connection established!");
                                     }
+                                    else
+                                    {
+                                        VoiceLog.Write("VOICE CONNECT FAILED");
+                                    }
+                                }
+                                else
+                                {
+                                    VoiceLog.Write("StartVoiceReceiver FAILED");
                                 }
                             }
                             break;
@@ -1426,6 +1501,62 @@ namespace ConsoleApp1
                                     Console.Error.WriteLine($"❌ Invalid volume value: {parts[1]}");
                                 }
                             }
+                            break;
+
+                        case "SET_SPEAKER_ICON":
+                            if (parts.Length > 1)
+                            {
+                                string mode = parts[1].ToLower().Trim();
+                                if (mode == "all" || mode == "others" || mode == "off")
+                                {
+                                    chatManager.SetSpeakerIconMode(mode);
+                                }
+                                else
+                                {
+                                    Console.Error.WriteLine($"Invalid speaker icon mode: {mode} (use all/others/off)");
+                                }
+                            }
+                            break;
+
+                        // Priority system commands (Flash UI → Server)
+                        case "SET_PRIORITY_ENABLED":
+                            if (parts.Length > 1)
+                                await chatManager.SendPrioritySettingUdp("ENABLED", parts[1].Trim());
+                            break;
+
+                        case "SET_PRIORITY_THRESHOLD":
+                            if (parts.Length > 1)
+                                await chatManager.SendPrioritySettingUdp("THRESHOLD", parts[1].Trim());
+                            break;
+
+                        case "SET_NON_PRIORITY_VOLUME":
+                            if (parts.Length > 1)
+                                await chatManager.SendPrioritySettingUdp("NON_PRIORITY_VOLUME", parts[1].Trim());
+                            break;
+
+                        case "SET_AUTO_PRIORITY_GUILD":
+                            if (parts.Length > 1)
+                                await chatManager.SendPrioritySettingUdp("GUILD_PRIORITY", parts[1].Trim());
+                            break;
+
+                        case "SET_AUTO_PRIORITY_LOCKED":
+                            if (parts.Length > 1)
+                                await chatManager.SendPrioritySettingUdp("LOCKED_PRIORITY", parts[1].Trim());
+                            break;
+
+                        case "SET_MAX_PRIORITY_SLOTS":
+                            if (parts.Length > 1)
+                                await chatManager.SendPrioritySettingUdp("MAX_PRIORITY_SLOTS", parts[1].Trim());
+                            break;
+
+                        case "ADD_MANUAL_PRIORITY":
+                            if (parts.Length > 1)
+                                await chatManager.SendPrioritySettingUdp("ADD_MANUAL", parts[1].Trim());
+                            break;
+
+                        case "REMOVE_MANUAL_PRIORITY":
+                            if (parts.Length > 1)
+                                await chatManager.SendPrioritySettingUdp("REMOVE_MANUAL", parts[1].Trim());
                             break;
 
                         case "SELECT_MIC":

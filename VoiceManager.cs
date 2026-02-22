@@ -57,10 +57,18 @@ namespace ConsoleApp1
        private HashSet<string> previousActiveSpeakers = new();
        private Dictionary<string, int> speakerSilentFrames = new();
 
+       // Speaker icon mode: "all" = everyone, "others" = others only, "off" = none
+       private volatile string speakerIconMode = "all";
+
        private string storedServerIP;
        private string storedPlayerID;
        private string storedVoiceID;
        private ProximityChatManager chatManagerRef;
+
+       // Auth retry & PONG tracking
+       private volatile bool isAuthConfirmed = false;
+       private int missedPongs = 0;
+       private volatile bool awaitingPong = false;
 
        private WaveOutEvent waveOut;
        private BufferedWaveProvider waveProvider;
@@ -229,7 +237,7 @@ namespace ConsoleApp1
                        Console.Error.WriteLine("[UDP_LISTENER] Ready signal sent");
                    }
 
-                   var result = await udpReceiveClient.ReceiveAsync();
+                   var result = await udpReceiveClient.ReceiveAsync(cancellationTokenSource.Token);
                    var packet = result.Buffer;
                    var senderEndpoint = result.RemoteEndPoint;
 
@@ -249,6 +257,8 @@ namespace ConsoleApp1
                                continue;
 
                            case "PONG": // Ping response
+                               missedPongs = 0;
+                               awaitingPong = false;
                                continue;
                        }
                    }
@@ -259,10 +269,15 @@ namespace ConsoleApp1
                        await ProcessUdpVoicePacket(packet, senderEndpoint);
                    }
                }
+               catch (OperationCanceledException)
+               {
+                   break;
+               }
                catch (Exception ex)
                {
                    if (!cancellationTokenSource.Token.IsCancellationRequested)
                    {
+                       VoiceLog.Write($"UDP_LISTENER error: {ex.Message}");
                        Console.Error.WriteLine($"[UDP_LISTENER] Error: {ex.Message}");
                        await Task.Delay(100, cancellationTokenSource.Token);
                    }
@@ -304,9 +319,6 @@ namespace ConsoleApp1
 
                byte[] opusAudioData = new byte[opusLength];
                Array.Copy(packet, 8, opusAudioData, 0, opusLength);
-
-               // Minimal logging for performance
-               // Console.Error.WriteLine($"[UDP_VOICE] Received {opusLength} Opus bytes from {speakerId}");
 
                await ProcessIncomingUdpVoice(opusAudioData, serverVolume, speakerId);
            }
@@ -511,26 +523,30 @@ namespace ConsoleApp1
                     }
 
                     //777592 - Speaker icon events: notify Flash when speakers start/stop
-                    foreach (var id in currentActiveSpeakerIds)
+                    // Mode "others" or "all" shows other players' icons; "off" skips entirely
+                    if (speakerIconMode != "off")
                     {
-                        speakerSilentFrames.Remove(id);
-                        if (!previousActiveSpeakers.Contains(id))
-                            Console.Error.WriteLine($"CMD:SPEAKING:{id}");
-                    }
-                    foreach (var id in previousActiveSpeakers)
-                    {
-                        if (!currentActiveSpeakerIds.Contains(id))
+                        foreach (var id in currentActiveSpeakerIds)
                         {
-                            speakerSilentFrames.TryGetValue(id, out int frames);
-                            frames++;
-                            if (frames >= 15) // ~300ms debounce
+                            speakerSilentFrames.Remove(id);
+                            if (!previousActiveSpeakers.Contains(id))
+                                Console.Error.WriteLine($"CMD:SPEAKING:{id}");
+                        }
+                        foreach (var id in previousActiveSpeakers)
+                        {
+                            if (!currentActiveSpeakerIds.Contains(id))
                             {
-                                Console.Error.WriteLine($"CMD:SILENT:{id}");
-                                speakerSilentFrames.Remove(id);
-                            }
-                            else
-                            {
-                                speakerSilentFrames[id] = frames;
+                                speakerSilentFrames.TryGetValue(id, out int frames);
+                                frames++;
+                                if (frames >= 15) // ~300ms debounce
+                                {
+                                    Console.Error.WriteLine($"CMD:SILENT:{id}");
+                                    speakerSilentFrames.Remove(id);
+                                }
+                                else
+                                {
+                                    speakerSilentFrames[id] = frames;
+                                }
                             }
                         }
                     }
@@ -819,6 +835,18 @@ namespace ConsoleApp1
            {
                string jsonData = Encoding.UTF8.GetString(packet, 4, packet.Length - 4);
                Console.Error.WriteLine($"[UDP_AUTH] Server response: {jsonData}");
+
+               // Check if auth was accepted
+               if (jsonData.Contains("ACCEPTED"))
+               {
+                   isAuthConfirmed = true;
+                   Console.Error.WriteLine("[UDP_AUTH] ✅ Authentication CONFIRMED by server");
+               }
+               else
+               {
+                   isAuthConfirmed = false;
+                   Console.Error.WriteLine("[UDP_AUTH] ❌ Authentication REJECTED by server");
+               }
            }
            catch (Exception ex)
            {
@@ -861,9 +889,36 @@ namespace ConsoleApp1
                 string jsonData = JsonSerializer.Serialize(authRequest);
                 byte[] authPacket = Encoding.UTF8.GetBytes("AUTH" + jsonData);
 
-                await udpSendClient.SendAsync(authPacket, authPacket.Length, serverEndpoint);
+                // Retry AUTH up to 3 times, waiting for server confirmation each time
+                isAuthConfirmed = false;
+                const int MAX_AUTH_RETRIES = 3;
 
-                Console.Error.WriteLine($"[UDP_AUTH] ✅ Authentication sent for player {playerId}");
+                for (int attempt = 1; attempt <= MAX_AUTH_RETRIES; attempt++)
+                {
+                    VoiceLog.Write($"AUTH attempt {attempt}/{MAX_AUTH_RETRIES}");
+                    Console.Error.WriteLine($"[UDP_AUTH] Sending AUTH attempt {attempt}/{MAX_AUTH_RETRIES}...");
+                    await udpSendClient.SendAsync(authPacket, authPacket.Length, serverEndpoint);
+
+                    // Wait up to 2 seconds for ARSP confirmation
+                    for (int wait = 0; wait < 20; wait++)
+                    {
+                        await Task.Delay(100);
+                        if (isAuthConfirmed) break;
+                    }
+
+                    if (isAuthConfirmed)
+                    {
+                        VoiceLog.Write($"AUTH confirmed on attempt {attempt}");
+                        Console.Error.WriteLine($"[UDP_AUTH] ✅ Authenticated on attempt {attempt}");
+                        return;
+                    }
+
+                    VoiceLog.Write($"AUTH no ARSP after attempt {attempt}");
+                    Console.Error.WriteLine($"[UDP_AUTH] No ARSP after attempt {attempt}, retrying...");
+                }
+
+                VoiceLog.Write("AUTH FAILED after all retries");
+                Console.Error.WriteLine("[UDP_AUTH] ⚠️ Auth not confirmed after all retries — continuing anyway");
             }
             catch (Exception ex)
             {
@@ -900,6 +955,11 @@ namespace ConsoleApp1
                speakerBuffers.Clear();
                speakerLastOpusPacket.Clear();
                speakerPlcFrames.Clear();
+
+               // Reset connection tracking
+               isAuthConfirmed = false;
+               missedPongs = 0;
+               awaitingPong = false;
 
                Console.Error.WriteLine("[UDP_VOICE_CLEANUP] Voice receiver stopped");
            }
@@ -940,6 +1000,19 @@ namespace ConsoleApp1
                return $"127.0.0.1:{VoiceReceivePort}";
            }
        }
+
+        public void SetSpeakerIconMode(string mode)
+        {
+            speakerIconMode = mode;
+            // If turning off, clear all active speaker icons
+            if (mode == "off")
+            {
+                foreach (var id in previousActiveSpeakers)
+                    Console.Error.WriteLine($"CMD:SILENT:{id}");
+                previousActiveSpeakers.Clear();
+                speakerSilentFrames.Clear();
+            }
+        }
 
         public void SetIncomingVolume(float volume)
         {
@@ -996,6 +1069,45 @@ namespace ConsoleApp1
        public bool IsVoiceSystemReady()
        {
            return IsVoiceReceiverActive && waveOut != null && waveProvider != null && udpReceiveClient != null;
+       }
+
+       public bool IsAuthConfirmed => isAuthConfirmed;
+
+       /// <summary>
+       /// Called by ProximityChatManager when missed PONGs indicate connection loss.
+       /// Re-sends AUTH to re-register with the server.
+       /// </summary>
+       public async Task ReAuthenticate()
+       {
+           if (!string.IsNullOrEmpty(storedServerIP) && !string.IsNullOrEmpty(storedPlayerID))
+           {
+               VoiceLog.Write("RE-AUTH triggered (connection loss detected)");
+               Console.Error.WriteLine("[UDP_AUTH] Re-authenticating after connection loss...");
+               isAuthConfirmed = false;
+               await SendAuthenticationToServer(storedServerIP, 2051, storedPlayerID, storedVoiceID);
+           }
+       }
+
+       /// <summary>
+       /// Called by ProximityChatManager's ping logic to track missed PONGs.
+       /// Returns true if too many PONGs missed (connection likely dead).
+       /// </summary>
+       public bool OnPingSent()
+       {
+           if (awaitingPong)
+           {
+               missedPongs++;
+               VoiceLog.Write($"Missed PONG #{missedPongs}");
+               Console.Error.WriteLine($"[UDP_PING] Missed PONG #{missedPongs}");
+           }
+           awaitingPong = true;
+           return missedPongs >= 3;
+       }
+
+       public void ResetPongTracking()
+       {
+           missedPongs = 0;
+           awaitingPong = false;
        }
        #endregion
 
