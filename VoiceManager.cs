@@ -76,6 +76,13 @@ namespace ConsoleApp1
 
        public int VoiceReceivePort { get; private set; } = 2051;
        public bool IsVoiceReceiverActive { get; private set; } = false;
+       private volatile bool _isConnecting = false;
+       /// <summary>Thread-safe check: true if currently in CONNECT_VOICE flow or already connected.</summary>
+       public bool IsConnectingOrConnected
+       {
+           get => _isConnecting || (IsVoiceReceiverActive && isAuthConfirmed);
+           set => _isConnecting = value;
+       }
 
        private WaveFormat detectedOutputFormat;
        private string detectedDeviceName;
@@ -611,8 +618,7 @@ namespace ConsoleApp1
                         int bufferedMs = waveProvider != null ? (int)(waveProvider.BufferedDuration.TotalMilliseconds) : -1;
                         double rms = audioProducedCount > 0 ? Math.Sqrt(mixedSampleSum / (double)(audioProducedCount * sampleCount)) : 0;
 
-                        Console.Error.WriteLine($"[MIXER_DIAG] cycles={mixCycleCount} produced={audioProducedCount} skipped={skippedCount} plc={plcGeneratedCount} silent={silentFrameCount} peak={mixedPeakSample} rms={rms:F0} waveOutBuf={bufferedMs}ms queues:{bufferInfo}");
-
+                        // MIXER_DIAG removed from production — reduces stderr pressure
                         mixCycleCount = 0;
                         audioProducedCount = 0;
                         skippedCount = 0;

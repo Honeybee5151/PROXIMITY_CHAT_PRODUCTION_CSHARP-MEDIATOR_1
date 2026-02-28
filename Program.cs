@@ -44,7 +44,7 @@ namespace ConsoleApp1
      {
          try
          {
-             // Keep log file small — overwrite on each launch
+             // Reset log file on each launch
              File.WriteAllText(LogPath, $"=== Voice Log Started {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===\n");
          }
          catch { }
@@ -416,8 +416,6 @@ namespace ConsoleApp1
          {
              byte[] pingPacket = Encoding.UTF8.GetBytes("PING");
              await udpClient.SendAsync(pingPacket, pingPacket.Length, serverEndpoint);
-             Console.Error.WriteLine("[UDP_PING] Sent ping to server");
-             Console.Error.WriteLine($"[DEBUG] Sending PING to server from port {((IPEndPoint)udpClient.Client.LocalEndPoint).Port}");
          }
          catch (Exception ex)
          {
@@ -781,7 +779,7 @@ namespace ConsoleApp1
             
             // Use a smoothing factor for a more visually stable bar
             const float SMOOTHING_FACTOR = 0.4f; 
-            const int VISUALIZER_UPDATE_SKIP = 3; // Send update every 3 data events (~16 updates/sec)
+            const int VISUALIZER_UPDATE_SKIP = 15; // Send update every 15 data events (~3 updates/sec)
 
             // 1. Update and smooth the level
             currentLevel = level; 
@@ -1317,6 +1315,21 @@ namespace ConsoleApp1
      {
          VoiceLog.Init();
          VoiceLog.Write("ConsoleApp1 starting");
+
+         // Catch any unhandled exceptions that bypass try/catch
+         AppDomain.CurrentDomain.UnhandledException += (sender, e) =>
+         {
+             var ex = e.ExceptionObject as Exception;
+             VoiceLog.Write($"UNHANDLED EXCEPTION (isTerminating={e.IsTerminating}): {ex?.GetType().Name}: {ex?.Message}");
+             VoiceLog.Write($"Stack: {ex?.StackTrace}");
+         };
+
+         TaskScheduler.UnobservedTaskException += (sender, e) =>
+         {
+             VoiceLog.Write($"UNOBSERVED TASK EXCEPTION: {e.Exception?.GetType().Name}: {e.Exception?.Message}");
+             e.SetObserved(); // Prevent process crash from unobserved task exceptions
+         };
+
          var chatManager = new ProximityChatManager();
          var actionScriptBridge = new ActionScriptBridge();
          var voiceManager = new VoiceManager(actionScriptBridge);
@@ -1330,15 +1343,26 @@ namespace ConsoleApp1
 
          var commandTask = Task.Run(async () => await ListenForCommands(chatManager, voiceManager, cancellationTokenSource.Token));
 
-         Console.Error.WriteLine("🚀🚀🚀 VERSION 14:55 BUILD LOADED 🚀🚀🚀");
-         Console.Error.WriteLine("Commands:");
-         Console.Error.WriteLine("  CONNECT_VOICE:serverIP:playerID:voiceID");
-         Console.Error.WriteLine("  START_MIC / STOP_MIC");
-         Console.Error.WriteLine("  SET_INCOMING_VOLUME:0.5");
+         // Background heartbeat — writes to voice_log.txt every 60s so we know process is alive
+         _ = Task.Run(async () =>
+         {
+             try
+             {
+                 while (!cancellationTokenSource.Token.IsCancellationRequested)
+                 {
+                     await Task.Delay(60000, cancellationTokenSource.Token).ConfigureAwait(false);
+                     VoiceLog.Write("HEARTBEAT — process alive");
+                 }
+             }
+             catch (OperationCanceledException) { }
+         });
+
+         Console.Error.WriteLine("VERSION v0.0.38 BUILD LOADED");
 
          Console.CancelKeyPress += (sender, e) =>
          {
              e.Cancel = true;
+             VoiceLog.Write("CTRL+C pressed — triggering shutdown");
              cancellationTokenSource.Cancel();
          };
 
@@ -1347,9 +1371,13 @@ namespace ConsoleApp1
          {
              await commandTask;
          }
-         catch (OperationCanceledException) { }
+         catch (OperationCanceledException)
+         {
+             VoiceLog.Write("commandTask cancelled (OperationCanceledException)");
+         }
          catch (Exception ex)
          {
+             VoiceLog.Write($"commandTask exception: {ex.GetType().Name}: {ex.Message}");
              Console.Error.WriteLine($"[MAIN] Command listener error: {ex.Message}");
          }
 
@@ -1395,56 +1423,74 @@ namespace ConsoleApp1
                 {
                     string command = Console.ReadLine();
 
-                    // ✅ ADD: Trace raw input immediately
-                    Console.Error.WriteLine($"[C# RAW INPUT] Received: '{command}'");
+                    // Log stdin commands to file (skip noisy ones)
+                    if (command != null && !command.StartsWith("KEEPALIVE"))
+                        VoiceLog.Write($"STDIN: {command}");
 
                     // stdin closed = parent process died or disconnected
                     if (command == null)
                     {
-                        Console.Error.WriteLine("[COMMAND_LISTENER] stdin closed (parent process gone) - shutting down");
+                        // Check if parent process (WebMain) is still alive
+                        string parentStatus = "unknown";
+                        try
+                        {
+                            var parentId = System.Diagnostics.Process.GetCurrentProcess().Id;
+                            var webMainProcs = System.Diagnostics.Process.GetProcessesByName("WebMain");
+                            parentStatus = webMainProcs.Length > 0
+                                ? $"WebMain ALIVE ({webMainProcs.Length} instances)"
+                                : "WebMain NOT FOUND";
+                        }
+                        catch (Exception ex) { parentStatus = $"check_failed: {ex.Message}"; }
+
+                        VoiceLog.Write($"STDIN CLOSED — {parentStatus} — triggering shutdown");
+                        Console.Error.WriteLine("[COMMAND_LISTENER] stdin closed - shutting down");
                         cancellationTokenSource.Cancel();
                         return;
                     }
 
                     if (string.IsNullOrEmpty(command)) continue;
 
-                    // ✅ ADD: Trim whitespace to prevent parsing issues
                     command = command.Trim();
-                    
                     var parts = command.Split(':');
-                    
-                    // ✅ ADD: Trace parsed command
-                    Console.Error.WriteLine($"[C# PARSED] Command: '{parts[0]}' | Args: {parts.Length - 1}");
 
                     switch (parts[0])
                     {
                         case "START_MIC":
-                            Console.Error.WriteLine("### EXECUTING: START_MIC ###");
+                            // START_MIC
                             chatManager.StartMicrophone();
                             break;
 
                         case "UI_ON":
-                            Console.Error.WriteLine("### EXECUTING: UI_ON ###");
+                            // UI_ON
                             chatManager.SetUIState(true);
                             Console.Error.WriteLine("🖥️ UI activated - audio level updates enabled");
                             break;
 
                         case "UI_OFF":
-                            Console.Error.WriteLine("### EXECUTING: UI_OFF ###");
+                            // UI_OFF
                             chatManager.SetUIState(false);
                             Console.Error.WriteLine("🖥️ UI deactivated - audio level updates disabled");
                             break;
 
                         case "CONNECT_VOICE":
-                            Console.Error.WriteLine("### EXECUTING: CONNECT_VOICE ###");
+                            // CONNECT_VOICE
                             if (parts.Length >= 4)
                             {
                                 string serverIP = parts[1];
                                 string playerID = parts[2];
                                 string voiceID = parts[3];
 
+                                // Guard against duplicate CONNECT_VOICE
+                                if (voiceManager.IsConnectingOrConnected)
+                                {
+                                    VoiceLog.Write($"CONNECT_VOICE IGNORED (already connecting/connected) server={serverIP} player={playerID}");
+                                    Console.Error.WriteLine("Already connected — ignoring duplicate CONNECT_VOICE");
+                                    break;
+                                }
+
+                                voiceManager.IsConnectingOrConnected = true;
                                 VoiceLog.Write($"CONNECT_VOICE server={serverIP} player={playerID}");
-                                Console.Error.WriteLine($"🔌 Connecting UDP voice for player {playerID}...");
+                                Console.Error.WriteLine($"Connecting UDP voice for player {playerID}...");
 
                                 voiceManager.StoreConnectionDetails(serverIP, playerID, voiceID);
 
@@ -1468,27 +1514,28 @@ namespace ConsoleApp1
                                 else
                                 {
                                     VoiceLog.Write("StartVoiceReceiver FAILED");
+                                    voiceManager.IsConnectingOrConnected = false;
                                 }
                             }
                             break;
 
                         case "STOP_MIC":
-                            Console.Error.WriteLine("### EXECUTING: STOP_MIC ###");
+                            // STOP_MIC
                             chatManager.StopMicrophone();
                             break;
 
                         case "ENABLE_AUDIO_TRANSMISSION":
-                            Console.Error.WriteLine("### EXECUTING: ENABLE_AUDIO_TRANSMISSION ###");
+                            // ENABLE_AUDIO_TRANSMISSION
                             chatManager.SetAudioTransmission(true);
                             break;
 
                         case "DISABLE_AUDIO_TRANSMISSION":
-                            Console.Error.WriteLine("### EXECUTING: DISABLE_AUDIO_TRANSMISSION ###");
+                            // DISABLE_AUDIO_TRANSMISSION
                             chatManager.SetAudioTransmission(false);
                             break;
 
                         case "SET_INCOMING_VOLUME":
-                            Console.Error.WriteLine("### EXECUTING: SET_INCOMING_VOLUME ###");
+                            // SET_INCOMING_VOLUME
                             if (parts.Length > 1)
                             {
                                 if (float.TryParse(parts[1], out float volume))
@@ -1560,7 +1607,7 @@ namespace ConsoleApp1
                             break;
 
                         case "SELECT_MIC":
-                            Console.Error.WriteLine($"### EXECUTING: SELECT_MIC with ID: {parts[1]} ###");
+                            // SELECT_MIC
                             if (parts.Length > 1)
                             {
                                 bool wasRunning = chatManager.IsMicrophoneEnabled;
@@ -1575,7 +1622,7 @@ namespace ConsoleApp1
                             break;
 
                         case "GET_MICS":
-                            Console.Error.WriteLine("### EXECUTING: GET_MICS ###");
+                            // GET_MICS
                             chatManager.RefreshMicrophones();
                             break;
 
@@ -1604,8 +1651,18 @@ namespace ConsoleApp1
                             Console.Error.WriteLine("  EXIT / QUIT - Shutdown");
                             break;
 
+                        case "KEEPALIVE":
+                            break;
+
+                        case "DISPOSE_NOTIFY":
+                            // Flash is about to dispose PCBridge — log the reason/stack trace
+                            string disposeReason = parts.Length > 1 ? string.Join(":", parts.Skip(1)) : "no_reason";
+                            VoiceLog.Write($"DISPOSE_NOTIFY from Flash: {disposeReason}");
+                            break;
+
                         case "EXIT":
                         case "QUIT":
+                            VoiceLog.Write($"EXIT/QUIT command received");
                             Console.Error.WriteLine("👋 Shutting down UDP voice system...");
                             cancellationTokenSource.Cancel();
                             return;
@@ -1617,13 +1674,16 @@ namespace ConsoleApp1
                  }
                  catch (Exception ex)
                  {
+                     VoiceLog.Write($"Command loop error: {ex.GetType().Name}: {ex.Message}");
                      Console.Error.WriteLine($"❌ Command error: {ex.Message}");
                      Thread.Sleep(100);
                  }
              }
+             VoiceLog.Write("Command loop exited normally (while condition false)");
          }
          catch (OperationCanceledException)
          {
+             VoiceLog.Write("Command listener cancelled (OperationCanceledException)");
              Console.Error.WriteLine("Command listener stopped");//22
          }
      }
